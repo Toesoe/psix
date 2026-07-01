@@ -1,0 +1,5 @@
+# Pakon F135+ scanner — userspace (libusb) access for psix.
+# Covers both USB identities: f235 = unloaded (pre-firmware), f135 = loaded.
+# TAG+="uaccess" grants the logged-in desktop user access via systemd-logind.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0f05", ATTR{idProduct}=="f235", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0f05", ATTR{idProduct}=="f135", MODE="0660", TAG+="uaccess"

@@ -1,0 +1,74 @@
+{% if status.mock_mode %}
+  <div class="info-card">
+    <h3 class="info-title">Mock scanner</h3>
+    <dl class="kv">
+      <dt>Product</dt><dd>{{ status.info.product }}</dd>
+      <dt>Serial</dt><dd>{{ status.info.serial_picl }}</dd>
+      <dt>State</dt><dd>{{ status.info.state }}</dd>
+    </dl>
+    <p class="info-empty" style="margin-top:10px;">No real hardware — switch to <strong>Hardware</strong> below to connect a Pakon F135+.</p>
+  </div>
+{% else %}
+  {% if status.phase == 'firmware_missing' %}
+  <div class="info-card fw-card" style="grid-column:1 / -1;">
+    <h3 class="info-title">Firmware needed</h3>
+    <p class="info-empty" style="margin-top:0;">
+      A Pakon scanner is connected but it needs its application firmware to start.
+      Add your firmware file below — psix loads it and initializes the scanner automatically.
+      <strong>You supply this file</strong> (Kodak property, one of
+      <code>{{ status.firmware.expected | join('</code>, <code>') | safe }}</code>; psix picks the right one).
+    </p>
+
+    <div class="fw-drop" data-action="fw-drop">
+      <input type="file" id="fw-file" accept=".hex,.ihex" multiple hidden>
+      <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 16V4m0 0L8 8m4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+      </svg>
+      <div>
+        <button type="button" class="btn btn-primary" data-action="fw-pick">Choose firmware files…</button>
+        <span class="fw-drop-hint">or drop <code>.hex</code> files here</span>
+      </div>
+    </div>
+
+    <dl class="kv" style="margin-top:12px;">
+      <dt>Firmware folder</dt><dd><code>{{ status.firmware.dir }}</code></dd>
+      <dt>Found</dt>
+      <dd>
+        {% if status.firmware.app_images %}{{ status.firmware.app_images | join(', ') }}
+        {% elif status.firmware.other_files %}{{ status.firmware.other_files | join(', ') }} <em>(no pakon*.hex yet)</em>
+        {% else %}<em>nothing yet</em>{% endif %}
+      </dd>
+    </dl>
+  </div>
+  {% endif %}
+
+  <div class="info-card">
+    <h3 class="info-title">Identification</h3>
+    {% if status.connected and status.info %}
+      <dl class="kv">
+        <dt>Product</dt><dd>{{ status.info.product }}</dd>
+        <dt>USB firmware</dt><dd>{{ status.info.usb_fw or '—' }}</dd>
+        <dt>Serial (PICL+)</dt><dd>{{ status.info.serial_picl or '—' }}</dd>
+        <dt>Serial (sub)</dt><dd>{{ status.info.serial_sub or '—' }}</dd>
+        <dt>EEPROM</dt><dd>{{ status.info.eeprom_bytes }} bytes</dd>
+      </dl>
+    {% else %}
+      <p class="info-empty">{{ status.error or 'Not connected — press Connect.' }}</p>
+    {% endif %}
+  </div>
+
+  <div class="info-card">
+    <h3 class="info-title">Status</h3>
+    {% if status.connected and status.info %}
+      <dl class="kv">
+        <dt>State</dt><dd>{{ status.info.state }}</dd>
+        <dt>HOST status</dt><dd>{{ status.info.host_status or '—' }}</dd>
+        <dt>Ready</dt><dd>{{ 'yes' if status.info.ready else 'no' }}</dd>
+        <dt>Comms</dt><dd>{{ 'ok' if status.info.comm_ok else 'partial' }}</dd>
+        <dt>Temp ADC</dt><dd>{{ status.info.temp_adc or '—' }}</dd>
+      </dl>
+    {% else %}
+      <p class="info-empty">No status yet.</p>
+    {% endif %}
+  </div>
+{% endif %}

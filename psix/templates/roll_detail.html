@@ -1,0 +1,195 @@
+{% extends 'base.html' %}
+{% block title %} — Roll {{ roll.label }}{% endblock %}
+
+{% block content %}
+<div class="crumbs">
+  <a href="{{ url_for('scan_page') }}">Rolls</a>
+  <span>›</span>
+  <span>Roll {{ roll.label }}{% if roll.name != roll.label %} · {{ roll.name }}{% endif %}</span>
+</div>
+
+<div class="roll-detail" data-roll-id="{{ roll.id }}">
+  <div class="run-status" id="run-status" hidden>
+    <span class="run-status-dot"></span>
+    <span class="run-status-text" id="run-status-text">Idle</span>
+    <span class="run-status-progress" id="run-status-progress"></span>
+  </div>
+
+  <div class="roll-stage">
+    <aside class="tool-rail tool-rail-left">
+      <div class="tool-rail-title">Tools</div>
+      {% if frames %}
+        <p class="tool-rail-hint">Rotate (portrait frames scan sideways)</p>
+        <div class="rotate-row">
+          <button type="button" class="btn btn-sm btn-ghost" data-action="rotate-left" data-roll-id="{{ roll.id }}" title="Rotate 90° left">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+          </button>
+          <button type="button" class="btn btn-sm btn-ghost" data-action="rotate-right" data-roll-id="{{ roll.id }}" title="Rotate 90° right">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          </button>
+        </div>
+        <button type="button" class="btn btn-sm btn-ghost" data-action="process-roll" data-roll-id="{{ roll.id }}">
+          Regenerate previews
+        </button>
+      {% else %}
+        <p class="tool-rail-hint">Adjustments appear here once the roll has frames.</p>
+      {% endif %}
+    </aside>
+
+    <section class="stage-center">
+      {% if frames %}
+        <img class="stage-img" id="stage-img"
+             src="{{ url_for('roll_preview', roll_id=roll.id, filename=frames[0].filename) }}"
+             alt="Frame {{ frames[0].label }}">
+        <div class="stage-caption" id="stage-caption">Frame {{ frames[0].label }} / {{ frames|length }}</div>
+      {% else %}
+        <div class="stage-empty">
+          <p>No frame previews yet.</p>
+          {% if roll.scans %}
+            <p class="tool-rail-hint">This roll has {{ roll.scans|length }} raw capture(s). Generate previews to detect and render the frames.</p>
+            <button type="button" class="btn btn-primary" data-action="process-roll" data-roll-id="{{ roll.id }}">
+              Generate previews
+            </button>
+          {% else %}
+            <p class="tool-rail-hint">No scans in this roll yet.</p>
+          {% endif %}
+        </div>
+      {% endif %}
+    </section>
+
+    <aside class="tool-rail tool-rail-right">
+      <div class="tool-rail-title">Colour</div>
+      {% if roll.scans %}
+        {% macro slider(key, label, lo, hi, step) %}
+          <div class="grade-row grade-{{ key.split('_')[-1] }}">
+            <label>{{ label }}<span class="grade-val" data-for="{{ key }}">{{ '%g'|format(grade[key]) }}</span></label>
+            <input type="range" name="{{ key }}" min="{{ lo }}" max="{{ hi }}" step="{{ step }}" value="{{ grade[key] }}">
+          </div>
+        {% endmacro %}
+        <form class="grade-form" id="grade-form" data-roll-id="{{ roll.id }}" data-defaults='{{ default_grade | tojson }}'>
+          <input type="hidden" name="rotate" value="{{ grade.rotate }}">
+          <div class="grade-tabs">
+            <button type="button" class="grade-tab is-active" data-tab="master">Master</button>
+            <button type="button" class="grade-tab" data-tab="sh">Shad</button>
+            <button type="button" class="grade-tab" data-tab="mid">Mid</button>
+            <button type="button" class="grade-tab" data-tab="hi">High</button>
+            <button type="button" class="grade-tab" data-tab="hsl">HSL</button>
+          </div>
+
+          <div class="grade-group" data-group="master">
+            {{ slider('density', 'Density', -100, 100, 1) }}
+            {{ slider('cyan', 'Cyan', -50, 50, 1) }}
+            {{ slider('magenta', 'Magenta', -50, 50, 1) }}
+            {{ slider('yellow', 'Yellow', -50, 50, 1) }}
+            {{ slider('contrast', 'Contrast', 0, 3, 0.05) }}
+            {{ slider('saturation', 'Saturation', 0, 2, 0.05) }}
+            {{ slider('decouple', 'Decouple', 0, 1, 0.05) }}
+          </div>
+          {% for grp in ['sh', 'mid', 'hi'] %}
+            <div class="grade-group" data-group="{{ grp }}" hidden>
+              {{ slider(grp ~ '_density', 'Density', -50, 50, 1) }}
+              {{ slider(grp ~ '_cyan', 'Cyan', -50, 50, 1) }}
+              {{ slider(grp ~ '_magenta', 'Magenta', -50, 50, 1) }}
+              {{ slider(grp ~ '_yellow', 'Yellow', -50, 50, 1) }}
+            </div>
+          {% endfor %}
+
+          {% set hsl_bands = [('red',0),('orange',30),('yellow',60),('green',120),('aqua',180),('blue',240),('purple',290),('magenta',330)] %}
+          <div class="grade-group" data-group="hsl" hidden>
+            <div class="hsl-bands">
+              {% for name, center in hsl_bands %}
+                <button type="button" class="hsl-band {{ 'is-active' if loop.first }}" data-band="{{ name }}"
+                        data-hue="{{ center }}" title="{{ name|capitalize }}"
+                        style="background:hsl({{ center }},65%,50%)"></button>
+              {% endfor %}
+            </div>
+            <div class="grade-row"><label>Hue<span class="grade-val" data-hsl="hue">0</span></label>
+              <input type="range" data-hsl="hue" min="-40" max="40" step="1" value="0"></div>
+            <div class="grade-row"><label>Saturation<span class="grade-val" data-hsl="sat">0</span></label>
+              <input type="range" data-hsl="sat" min="-1" max="1" step="0.05" value="0"></div>
+            <div class="grade-row"><label>Luminance<span class="grade-val" data-hsl="lum">0</span></label>
+              <input type="range" data-hsl="lum" min="-1" max="1" step="0.05" value="0"></div>
+            {% for name, center in hsl_bands %}
+              <input type="hidden" name="{{ name }}_hue" value="{{ grade[name ~ '_hue'] }}">
+              <input type="hidden" name="{{ name }}_sat" value="{{ grade[name ~ '_sat'] }}">
+              <input type="hidden" name="{{ name }}_lum" value="{{ grade[name ~ '_lum'] }}">
+            {% endfor %}
+          </div>
+
+          <div class="grade-actions">
+            <button type="button" class="btn btn-sm btn-ghost" data-action="copy-grade" data-roll-id="{{ roll.id }}"
+                    title="Copy this frame's colour grade">⧉ Copy</button>
+            <button type="button" class="btn btn-sm btn-ghost" data-action="paste-grade" data-roll-id="{{ roll.id }}"
+                    title="Paste the copied grade onto this frame">⤵ Paste</button>
+            <button type="button" class="btn btn-sm btn-ghost" data-action="reset-grade" data-roll-id="{{ roll.id }}"
+                    title="Reset all colour sliders to neutral">↺ Reset</button>
+          </div>
+          <button type="button" class="btn btn-sm btn-primary" data-action="apply-grade" data-roll-id="{{ roll.id }}">
+            Apply grade
+          </button>
+          <button type="button" class="btn btn-sm btn-ghost grade-export" data-action="export-frame" data-roll-id="{{ roll.id }}"
+                  title="Save this frame at full resolution to the roll's export/ folder">⤓ Export image</button>
+        </form>
+
+        {% macro eye_toggle(id, label, on) %}
+          <button type="button" class="ice-eye{{ ' is-on' if on }}" id="{{ id }}"
+                  aria-pressed="{{ 'true' if on else 'false' }}" title="{{ label }}">
+            <svg class="eye eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            <svg class="eye eye-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.94 17.94A10 10 0 0 1 12 20c-7 0-11-8-11-8a18 18 0 0 1 5.06-5.94M9.9 4.24A9 9 0 0 1 12 4c7 0 11 8 11 8a18 18 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+              <line x1="1" y1="1" x2="23" y2="23"/></svg>
+            <span>{{ label }}</span>
+          </button>
+        {% endmacro %}
+        {% if has_ir %}
+        <div class="ice-section" id="ice-panel" data-roll-id="{{ roll.id }}">
+          <div class="tool-rail-title ice-title">ICE</div>
+          <div class="ice-eyes">
+            {{ eye_toggle('ice-on-toggle', 'ICE on', true) }}
+            {{ eye_toggle('ice-mask-toggle', 'Show mask', false) }}
+          </div>
+          <div class="ice-controls" id="ice-controls">
+            <div class="grade-row">
+              <label>Threshold<span class="grade-val" data-for="ir_thresh">{{ '%g'|format(ice.ir_thresh) }}</span></label>
+              <input type="range" id="ice-thresh" min="0.01" max="0.20" step="0.005" value="{{ ice.ir_thresh }}">
+            </div>
+            <div class="grade-row">
+              <label>Min size<span class="grade-val" data-for="ir_min_size">{{ ice.ir_min_size }}</span></label>
+              <input type="range" id="ice-min-size" min="1" max="25" step="1" value="{{ ice.ir_min_size }}">
+            </div>
+            <div class="grade-row">
+              <label>Max size<span class="grade-val" data-for="ir_kernel">{{ ice.ir_kernel }}</span></label>
+              <input type="range" id="ice-kernel" min="9" max="61" step="2" value="{{ ice.ir_kernel }}">
+            </div>
+            <p class="tool-rail-hint"><b>ICE on</b> = de-dusted vs original (before/after); <b>Show mask</b> = red detected dust on the photo. Threshold = how deep an IR dip counts (lower = more); Min size = drop blobs under N px (reject noise); Max size = widest defect resolved. <b>Apply ICE</b> commits the current settings.</p>
+            <button type="button" class="btn btn-sm btn-primary" data-action="apply-ice" data-roll-id="{{ roll.id }}">
+              Apply ICE
+            </button>
+          </div>
+        </div>
+        {% endif %}
+      {% else %}
+        <p class="tool-rail-hint">Scan into this roll to grade.</p>
+      {% endif %}
+    </aside>
+  </div>
+
+  <div class="roll-carousel" id="roll-carousel">
+    {% for f in frames %}
+      <button type="button" class="carousel-item {{ 'is-active' if loop.first }}"
+              data-index="{{ f.index }}" data-label="{{ f.label }}"
+              data-src="{{ url_for('roll_preview', roll_id=roll.id, filename=f.filename) }}"
+              data-grade='{{ f.grade | tojson }}'
+              title="Frame {{ f.label }}">
+        <img src="{{ url_for('roll_preview', roll_id=roll.id, filename=f.filename) }}" alt="Frame {{ f.label }}" loading="lazy">
+        <span class="carousel-num">{{ f.label }}</span>
+      </button>
+    {% else %}
+      <p class="empty-state">No frames in this roll yet.</p>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

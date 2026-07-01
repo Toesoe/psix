@@ -1,0 +1,17 @@
+# venv / build
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Kodak scanner firmware — user supplies from their Pakon CD; never commit (copyright)
+psix/assets/firmware/pakon*.hex
+psix/assets/firmware/pkninit.hex
+
+# local runtime data / scans
+data/
+output/
+*.bin
+*.tiff

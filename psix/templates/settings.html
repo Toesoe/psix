@@ -1,0 +1,85 @@
+{% extends 'base.html' %}
+{% block title %} — Settings{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h1 class="panel-title">Scanner</h1>
+      <p class="panel-sub">Connection, identification, and runtime mode.</p>
+    </div>
+    <div class="panel-actions">
+      <button type="button" class="btn btn-ghost" data-action="connect">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M16 4v4h-4"/><path d="M16 8a6 6 0 1 0-1.6 5"/>
+        </svg>
+        <span>Connect</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="info-grid" id="scanner-info">
+    {% include 'partials/scanner_info.html' %}
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2 class="panel-title">Mode</h2>
+      <p class="panel-sub">Pick how psix talks to the scanner. Changes apply immediately.</p>
+    </div>
+  </header>
+
+  <form class="form" data-config-form>
+    <div class="form-row">
+      <label class="form-label">Connection</label>
+      <div class="seg">
+        <label class="seg-item">
+          <input type="radio" name="mock_mode" value="false" {{ 'checked' if not config.mock_mode }}>
+          <span>Hardware</span>
+        </label>
+        <label class="seg-item">
+          <input type="radio" name="mock_mode" value="true" {{ 'checked' if config.mock_mode }}>
+          <span>Mock</span>
+        </label>
+      </div>
+      <p class="form-hint">
+        {% if config.mock_mode %}
+          Using the in-process <strong>mock scanner</strong> — no hardware touched. Scans write a small synthetic file.
+        {% else %}
+          Hardware mode watches USB continuously: power on the scanner and psix detects it, loads firmware if needed, and initializes it automatically.
+        {% endif %}
+      </p>
+    </div>
+
+    {% if not config.mock_mode %}
+    <div class="form-row">
+      <label class="check">
+        <input type="checkbox" name="auto_prepare" {{ 'checked' if config.auto_prepare }}>
+        Auto-prepare on power-on (load firmware + initialize)
+      </label>
+      <p class="form-hint">Off = detect the scanner but don't load/initialize it automatically.</p>
+    </div>
+    {% endif %}
+  </form>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2 class="panel-title">Output</h2>
+      <p class="panel-sub">Where rolls and raw scans are written. Each roll gets its own subfolder.</p>
+    </div>
+  </header>
+
+  <form class="form" data-config-form>
+    <div class="form-row">
+      <label class="form-label" for="output_dir">Output folder</label>
+      <input class="input" id="output_dir" name="output_dir"
+             value="{{ config.output_dir }}" spellcheck="false" autocomplete="off">
+      <p class="form-hint">Default is <code>output/</code> in the project root. The folder is created on first scan.</p>
+    </div>
+  </form>
+</section>
+{% endblock %}

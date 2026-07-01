@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psix"
+version = "0.1.0"
+description = "psix — Pakon Scanner Interface for Linux. Userspace Pakon F135+ scanner driver + capture/scan/C-41 colour app."
+requires-python = ">=3.10"
+dependencies = [
+    # driver
+    "libusb1",
+    "numpy",
+    "scipy",
+    "tifffile",
+    # headless = no bundled Qt/GTK GUI plugins (smaller). Only core cv2 APIs are used.
+    "opencv-python-headless",
+    "Pillow>=10",
+    # app — psix runs as a local web server you open in your browser.
+    "Flask>=3.0",
+]
+
+[project.scripts]
+psix = "psix.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["psix*"]
+
+# Bundle the data the app needs (resolved at runtime via importlib.resources):
+#   assets/oem_tone_shape.npy        — measured C-41 tone transfer (ours)
+#   assets/firmware/ezusb_stage2.ihex — generic EZ-USB loader (ours)
+#   templates/ + static/             — the web UI
+# NOT bundled: Kodak scanner firmware (pakon*.hex) — the user supplies it from their Pakon CD.
+[tool.setuptools.package-data]
+psix = [
+    "assets/*",
+    "assets/firmware/*",
+    "templates/*.html",
+    "templates/partials/*.html",
+    "static/css/*.css",
+    "static/js/*.js",
+]

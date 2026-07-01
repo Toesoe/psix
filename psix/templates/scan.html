@@ -1,0 +1,72 @@
+{% extends 'base.html' %}
+{% block title %} — Scan{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h1 class="panel-title">New roll scan</h1>
+      <p class="panel-sub">Each roll gets its own folder under the output directory; the raw scan is saved inside it.</p>
+    </div>
+  </header>
+
+  <form class="form" id="new-scan-form">
+    <div class="form-row">
+      <label class="form-label" for="roll-name">Roll name</label>
+      <input class="input" id="roll-name" name="name"
+             placeholder="{{ next_label }}" value="{{ next_label }}" autocomplete="off">
+      <p class="form-hint">Next Roll ID is <strong>{{ next_label }}</strong>. Leave as-is for the OEM-style number, or give it a name.</p>
+    </div>
+    <div class="form-actions form-row" style="flex-direction:row; align-items:center; gap:16px;">
+      <button type="submit" class="btn btn-primary" id="start-scan-btn">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="2.5"/>
+        </svg>
+        <span>Start scan</span>
+      </button>
+      <label class="check"><input type="checkbox" id="ir-toggle"> 4-channel (IR)</label>
+    </div>
+  </form>
+
+  <div class="run-status" id="run-status" hidden>
+    <span class="run-status-dot"></span>
+    <span class="run-status-text" id="run-status-text">Idle</span>
+    <span class="run-status-progress" id="run-status-progress"></span>
+    <button type="button" class="btn btn-sm btn-danger" id="stop-scan-btn">Stop</button>
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2 class="panel-title">Rolls</h2>
+      <p class="panel-sub">Saved under <code>{{ output_dir }}</code></p>
+    </div>
+  </header>
+
+  <div class="roll-list" id="roll-list">
+    {% for roll in rolls %}
+      <div class="roll-card" data-roll-id="{{ roll.id }}">
+        <a class="roll-card-link" href="{{ url_for('roll_detail_page', roll_id=roll.id) }}">
+          <div class="roll-card-head">
+            <span class="roll-card-name">{{ roll.name }}</span>
+            <span class="badge badge-status">Roll {{ roll.label }}</span>
+          </div>
+          <div class="roll-card-meta">{{ roll.dir }}</div>
+          <div class="roll-card-counts">
+            <span class="count-pill {{ 'count-done' if roll.scans }}">{{ roll.scans|length }} scan{{ '' if roll.scans|length == 1 else 's' }}</span>
+          </div>
+        </a>
+        <button type="button" class="btn btn-sm" data-action="scan-roll" data-roll-id="{{ roll.id }}">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="2.5"/>
+          </svg>
+          <span>Add scan</span>
+        </button>
+      </div>
+    {% else %}
+      <p class="empty-state">No rolls yet — start your first roll scan above.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
