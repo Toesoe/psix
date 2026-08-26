@@ -467,17 +467,20 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
     sidecar_ok = False
     if flatref:
         z = np.load(flatref)
-        if 'white' in z and z['white'].shape[0] == W and max(float(z['white'].max()), 1) <= 64000:
+        if 'white' in z and z['white'].shape[-1] == W and max(float(z['white'].max()), 1) <= 64000:
             sidecar_ok = True
-    if not sidecar_ok or white_ir == 'rebate':
+    want_rebate_ir = isinstance(white_ir, str) and white_ir == 'rebate'
+    if not sidecar_ok or want_rebate_ir:
         rw, rw_ir = _rebate_refs(binpath, phase, frames, P, W * 3)
         if not sidecar_ok and rw is not None:
             whites = rw
             print("  flat-field: rebate-derived per-column white (%d gap span(s))" % (len(frames) - 1))
-        if white_ir == 'rebate':
+        if want_rebate_ir:
             white_ir = rw_ir
             if white_ir is not None:
                 print("  flat-field: rebate-derived white_ir (%d cols)" % white_ir.shape[0])
+    if isinstance(white_ir, str):                      # no usable gaps -> no ICE (never leak the sentinel)
+        white_ir = None
     order = sorted(range(3), key=lambda c: off[c])
     halo = max(abs(o) for o in off) + abs(ir_offset) + 5
     del seg, spl
