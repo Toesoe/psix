@@ -29,8 +29,10 @@ class ScannerError(Exception):
 
 def _identity(health):
     """Map PakonScanner.health() to the flat identity dict the UI renders."""
+    model = health.get("model") or "F135+"
     return {
-        "product": "Pakon F135+",
+        "product": "Pakon %s" % model,
+        "model": model,
         "firmware": health.get("usb_fw"),
         "usb_fw": health.get("usb_fw"),
         "serial_picl": health.get("serial_picl"),
@@ -84,6 +86,35 @@ class ScannerDriver:
         from .pakon import load as pakon_load
         with self._lock:
             return bool(pakon_load.load_firmware(log=log))
+
+    def move_film(self, seconds=6.0, reverse=False, rate=None):
+        """Motor-only film move (no lamp, no scan): forward to advance/eject,
+        reverse to rewind. Full device lifecycle (open → init → move → shutdown).
+        Returns True if the move ran. Raises ScannerError if the device is busy
+        or unavailable."""
+        from .pakon import scanner as pakon_scanner
+        from .pakon import scan as pakon_scan2
+        if not self._lock.acquire(blocking=False):
+            raise ScannerError("scanner is busy")
+        try:
+            sc = pakon_scanner.PakonScanner(verbose=False)
+            sc.open()
+            sc.initialize()
+            try:
+                if rate is None:
+                    from .pakon import unitdata as pakon_unitdata
+                    rate = (pakon_unitdata.transport_rate(getattr(sc.dev, 'unit_info', None))
+                            or pakon_scan2.MOTOR_RATE_PLUS)
+                return bool(pakon_scan2.move_film(sc.dev, seconds, rate, reverse))
+            finally:
+                try:
+                    sc.shutdown()
+                except Exception:
+                    pass
+        except Exception as exc:
+            raise ScannerError(str(exc))
+        finally:
+            self._lock.release()
 
     def firmware_status(self):
         """Filesystem-only check of the firmware dir (no device access, no lock)."""
@@ -156,7 +187,7 @@ class ScannerDriver:
                     pass
 
     def develop(self, bin_path, flatref_path, out_prefix, *, ir_thresh=None, ir_kernel=None,
-                ir_min_size=None):
+                ir_min_size=None, ir=None):
         """Detect frames and write per-frame raw-negative TIFFs (the cached
         'digital negatives' that grading re-renders). Returns their paths.
         This is the expensive step (flat-field + frame detect + IR-ICE); run it once.
@@ -174,7 +205,7 @@ class ScannerDriver:
             str(bin_path),
             str(flatref_path) if flatref_path else None,
             str(out_prefix),
-            _INVERT_GAMMA, _INVERT_CONTRAST, None, neg_only=True, **ice_kw,
+            _INVERT_GAMMA, _INVERT_CONTRAST, None, neg_only=True, ir=ir, **ice_kw,
         )
         return sorted(glob.glob("%s_f[0-9][0-9]_neg.tiff" % out_prefix))
 

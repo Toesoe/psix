@@ -147,7 +147,8 @@ def _grade_negs(driver, negs, previews_dir, base, grade, on_event):
 
 
 def develop_previews(driver, bin_path, flatref_path, negs_dir, previews_dir, base,
-                     grade=None, on_event=None, ir_thresh=None, ir_kernel=None, ir_min_size=None):
+                     grade=None, on_event=None, ir_thresh=None, ir_kernel=None, ir_min_size=None,
+                     ir=None):
     """Develop the raw capture into cached negatives, then grade → preview JPEGs.
     Returns (frame_jpeg_names, neg_paths). ir_* override ICE detection."""
     def emit(event, data=None):
@@ -160,7 +161,7 @@ def develop_previews(driver, bin_path, flatref_path, negs_dir, previews_dir, bas
     negs_dir = Path(negs_dir)
     negs_dir.mkdir(parents=True, exist_ok=True)
     emit("phase", {"phase": "processing", "message": "developing (detecting frames)…"})
-    negs = driver.develop(bin_path, flatref_path, str(negs_dir / base),
+    negs = driver.develop(bin_path, flatref_path, str(negs_dir / base), ir=ir,
                           ir_thresh=ir_thresh, ir_kernel=ir_kernel, ir_min_size=ir_min_size)
     names = _grade_negs(driver, negs, previews_dir, base, grade, on_event)
     return names, negs

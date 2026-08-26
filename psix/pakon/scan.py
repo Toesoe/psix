@@ -45,20 +45,50 @@ def reset_to_idle(dev):
     state, which is lamp-off. This is the reliable teardown (grounded: that's the confirmed init result).
 
     Uses the RE-derived init builder (pakon_initseq.build_init_steps, byte-identical to the old
-    dev36_init.json replay) instead of replaying the opaque blob,
+    dev36_init.json replay on an F-135+) instead of replaying the opaque blob,
     so the teardown is fully named/understood. run_steps() reads the live EEPROM record headers itself."""
     try:
-        seq = pakon_initseq.build_init_steps()
+        seq = pakon_initseq.build_init_steps(light=dev.AD_PICL_PLUS, motor=dev.AD_SUB,
+                                             tec=getattr(dev, 'is_plus', True))
         pakon_initseq.run_steps(dev, seq)
         return True
     except Exception:
         return False
 
 
-def is_lamp(pkt):
-    return len(pkt) >= 5 and pkt[0] == 2 and pkt[2] == 0x40 and pkt[4] == 0x80
-def is_trigger(pkt):
-    return len(pkt) >= 5 and pkt[0] == 2 and pkt[2] == 0x40 and pkt[4] == 0x91
+MOTOR_RATE_PLUS = 0x1726            # the Plus capture's transport rate (F-135+ default)
+
+
+def move_film(dev, seconds, rate=None, reverse=False):
+    """Motor-ONLY film move (no lamp, no scan, no triggers): write the transport
+    rate (reg0xa5), GO forward (0xa0) or reverse (0xa1), run `seconds`, then stop
+    (0xa2 + rate 0). Uses only the HW-validated motor register set, so it is safe
+    on both generations — this is how film gets positioned/ejected outside a scan
+    (psix has no OEM-style frame-advance distance command; timing is open-loop).
+    Returns True if the move ran (stop is best-effort)."""
+    if rate is None:
+        rate = MOTOR_RATE_PLUS
+    ran = False
+    try:
+        dev.write_reg(dev.AD_SUB, 0xa5, bytes([rate & 0xff, (rate >> 8) & 0xff]))
+        dev.write2(dev.AD_SUB, 0xa1 if reverse else 0xa0)
+        ran = True
+        time.sleep(max(0.0, seconds))
+    except (PakonError, usb1.USBError):
+        pass
+    finally:
+        try:
+            dev.write_reg(dev.AD_SUB, 0xa5, b'\x00\x00')
+            dev.write2(dev.AD_SUB, 0xa2)
+        except (PakonError, usb1.USBError):
+            pass
+    return ran
+
+
+def is_lamp(pkt, light=0x40):
+    return len(pkt) >= 5 and pkt[0] == 2 and pkt[2] == light and pkt[4] == 0x80
+def is_trigger(pkt, light=0x40):
+    return len(pkt) >= 5 and pkt[0] == 2 and pkt[2] == light and pkt[4] == 0x91
 
 
 def calibrate(dev, steps, out_path, hold, pump, max_bytes):
@@ -94,7 +124,7 @@ def calibrate(dev, steps, out_path, hold, pump, max_bytes):
 
     # locate the trigger; pre-trigger commands run with NO EP6 draining
     trig_idx = next((i for i, s in enumerate(steps)
-                     if is_trigger(bytes.fromhex(s['data']))), len(steps) - 1)
+                     if is_trigger(bytes.fromhex(s['data']), dev.AD_PICL_PLUS)), len(steps) - 1)
     t_start = time.monotonic()
     try:
         # --- Phase A: pre-trigger setup, no image ---
@@ -123,7 +153,7 @@ def calibrate(dev, steps, out_path, hold, pump, max_bytes):
             # issue any due replay commands
             while si < len(sched) and sched[si][0] <= now:
                 pkt = sched[si][1]; si += 1
-                if is_lamp(pkt):
+                if is_lamp(pkt, dev.AD_PICL_PLUS):
                     print("  [%5.1fs] LAMP %s (EP6 %d B)"
                           % (time.monotonic() - t_start, 'ON' if pkt[5] else 'OFF', img['bytes']))
                 try:
@@ -168,8 +198,20 @@ def build_current(r, g, b, ir=0):
     return bytes([b & 0xff, ir & 0xff, r & 0xff, 0, g & 0xff])
 
 
-# --- §2c resolution / scan geometry ------------------------------------------
-# Clean-room control of the CCD geometry = the registers the OEM changes per base tier (a selector
+# --- F-135 base16 operating point (OEM USB capture ground truth) -------------
+# From pakon-macos scan.pakscan (3ch) + scan_fullroll.pakscan (IR): the OEM
+# driving a real F-135 at base16. The Plus-derived scales (currents 8-20,
+# duties <=900, exposure base 982, trigger 3c/310001) do NOT transfer.
+F135_CURRENTS = (2, 3, 3)          # (R, G, B) -> reg0x81 [B,IR,R,0,G] = 3,2,2,3
+F135_CURRENT_IR = 2                # IR current (IR scans)
+F135_EXP = (896, 707, 278)         # (R, G, B) duties — film and open gate (OEM uses ~same)
+F135_EXP_BASE = 1858               # reg0x82 base field (Plus: 0x03d6=982)
+F135_IR_DUTY = 1353                # IR duty field (reg0x82 u16[1])
+F135_TRIGGER = b'\x10\x00\x01'     # reg0x91 trigger word (Plus: 3c0001 3ch / 310001 IR)
+F135_MOTOR_RATE = 0x0615           # 1557 — OEM base16 transport rate, 3ch and IR alike
+
+
+# --- §2c resolution / scan geometry ------------------------------------------# Clean-room control of the CCD geometry = the registers the OEM changes per base tier (a selector
 # picks the geometry + rate). The per-tier CONSTANTS were extracted from
 # the device's registry defaults — the defaults used when the
 # \DpiBase{4,8,16}_35 registry keys are absent (our registry-less case). base16 = native = the init
@@ -369,7 +411,7 @@ def servo(dev, steps, target=0xfa00, tol=0x80, max_iter=40, start_exp=0x0200, ve
     import struct
     # pre-trigger setup (no EP6) up to and incl. the trigger
     trig_idx = next((i for i, s in enumerate(steps)
-                     if is_trigger(bytes.fromhex(s['data']))), len(steps) - 1)
+                     if is_trigger(bytes.fromhex(s['data']), dev.AD_PICL_PLUS)), len(steps) - 1)
     prev = steps[0]['rel']
     for s in steps[:trig_idx + 1]:
         gap = s['rel'] - prev; prev = s['rel']
@@ -522,7 +564,28 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
     img = {'bytes': 0, 'pkts': 0, 'mean': 0.0, 'film_seen': False, 'last_film_t': 0.0,
            'cmax': (0, 0, 0), 'writing': False, 'total': 0,
            'grab': None, 'grab_need': 0, 'og': None}
-    LINE_S = 2000 * 3                                  # samples/line (3ch)
+    LINE_S = 2000 * 3                                  # samples/line (3ch) — DETECTED live below:
+    # IR-mode line layout: [RGB visible samples][IR block]. Plus: 6000+2000 = 8000;
+    # F-135: 5910+~1968 = 7880 (1970px RGB + IR block).
+    IR_RGB_SAMPLES = 6000 if getattr(dev, 'is_plus', True) else 5910
+    img['det'] = bytearray()                           # stream sample for line-period detection
+    # the CCD window width follows the scan config (idx5): 2000 px on a Plus, 1970 px on an
+    # F-135 (idx5=2043) -> 5910-sample lines. The dark-pass block measures the marker spacing
+    # from img['det'] and corrects LINE_S before any grab/white-ref/servo slicing depends on it.
+    def _detect_line_period():
+        """Dominant marker spacing in the detection sample -> LINE_S. The calibration
+        pass (trigger#1) runs a different, full-window format than transport, so the
+        sample is reset at trigger#2 and this runs again before the white-ref grab."""
+        nonlocal LINE_S
+        _raw = np.frombuffer(bytes(img['det']), dtype='<u2')
+        _mk = np.flatnonzero(_raw & 1)
+        if len(_mk) > 20:
+            _d = np.diff(_mk)
+            _m = int(np.bincount(_d).argmax())
+            if 3000 <= _m <= 9000 and _m != LINE_S:
+                LINE_S = _m
+                print("  [%5.1fs] line period: %d samples (%d px x 3)"
+                      % (time.monotonic() - t0, LINE_S, LINE_S // 3))
 
     def _emit(event, data=None):
         """Optional progress callback (on_progress(event, data)). No-op + fully
@@ -547,6 +610,8 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                 if len(a) >= 3:                              # per-phase max (for the exposure servo)
                     img['cmax'] = (int(a[0::3].max()), int(a[1::3].max()), int(a[2::3].max()))
                 img['total'] += n                            # absolute stream position since ring open
+                if len(img['det']) < (1 << 20):              # line-period detection sample
+                    img['det'] += b
                 if img['grab'] is not None and len(img['grab']) < img['grab_need']:
                     img['grab'] += b                         # marker-aligned measurement/white capture
                 if img['writing']:                           # only capture to file after the servo
@@ -607,9 +672,10 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             #     (validate the window yields ~300/ch dark 8000-sample lines on a no-film/throwaway run before
             #     trusting it on a real roll). ----
             if (not dark_done[0] and ep6_open[0] and t == 2 and len(pkt) >= 6
-                    and addr == 0x40 and pkt[4] == 0x80 and pkt[5] != 0x00):
+                    and addr == dev.AD_PICL_PLUS and pkt[4] == 0x80 and pkt[5] != 0x00):
                 dark_done[0] = True
-                Pd = (2000 * 4) if ir else LINE_S          # 8000-sample 4-ch line vs 6000 3-ch
+                _detect_line_period()
+                Pd = LINE_S                                # detected line period (8000/7880 IR, 5910/6000 3ch)
                 img['grab'] = bytearray(); img['grab_need'] = DARK_LINES * Pd * 2
                 dend = time.monotonic() + 1.5
                 while len(img['grab']) < img['grab_need'] and time.monotonic() < dend:
@@ -625,9 +691,10 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                     mm = da[ph: ph + ((len(da) - ph) // Pd) * Pd]
                     if len(mm) >= Pd:
                         ln = mm.reshape(-1, Pd).astype(np.float32)
-                        dark_ref[0] = np.stack([ln[:, :6000][:, c::3].mean(axis=0) for c in range(3)])  # (3,2000)
+                        rgb_vis = IR_RGB_SAMPLES if ir else (Pd - (Pd % 3))
+                        dark_ref[0] = np.stack([ln[:, :rgb_vis][:, c::3].mean(axis=0) for c in range(3)])
                         if ir:
-                            dark_ir_ref[0] = ln[:, 6000:8000].mean(axis=0)                              # (2000,)
+                            dark_ir_ref[0] = ln[:, IR_RGB_SAMPLES:Pd].mean(axis=0)                              # (2000,)
                         print("  [%5.1fs] DARK ref: %d lamp-off %s lines, per-ch mean R/G/B=%.0f/%.0f/%.0f%s"
                               % (time.monotonic() - t0, ln.shape[0], "4-ch" if ir else "3-ch",
                                  dark_ref[0][0].mean(), dark_ref[0][1].mean(), dark_ref[0][2].mean(),
@@ -635,17 +702,22 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                 if dark_ref[0] is None:
                     print("  [%5.1fs] DARK ref: no lamp-off lines captured -> decode uses flat SENSOR_DARK"
                           % (time.monotonic() - t0))
-            if t == 2 and len(pkt) >= 5 and addr == 0x40 and pkt[4] == 0x80:
+            if t == 2 and len(pkt) >= 5 and addr == dev.AD_PICL_PLUS and pkt[4] == 0x80:
                 print("  [%5.1fs] LAMP reg0x80=%s" % (time.monotonic() - t0, pkt[5:5 + pkt[3]].hex()))
-            if t == 2 and len(pkt) >= 5 and addr == 0x44 and pkt[4] == 0xa5:
+            if t == 2 and len(pkt) >= 5 and addr == dev.AD_SUB and pkt[4] == 0xa5:
                 print("  [%5.1fs] MOTOR rate=%s" % (time.monotonic() - t0, pkt[5:5 + pkt[3]].hex()))
-            if t == 4 and len(pkt) >= 5 and addr == 0x44 and pkt[4] == 0xa0:
+            if t == 4 and len(pkt) >= 5 and addr == dev.AD_SUB and pkt[4] == 0xa0:
                 print("  [%5.1fs] MOTOR GO forward" % (time.monotonic() - t0)); open_ep6()
-            if t == 2 and len(pkt) >= 5 and addr == 0x40 and pkt[4] == 0x91:
+            if t == 2 and len(pkt) >= 5 and addr == dev.AD_PICL_PLUS and pkt[4] == 0x91:
                 ntrig[0] += 1
                 print("  [%5.1fs] TRIGGER#%d (%s)" % (time.monotonic() - t0, ntrig[0],
                       "calibration" if ntrig[0] == 1 else "TRANSPORT begins"))
                 open_ep6()
+                if ntrig[0] == 2:
+                    # the calibration pass runs a DIFFERENT (full-window) line format than
+                    # transport — reset the detection sample so the line period is
+                    # re-measured on transport-format lines only.
+                    img['det'] = bytearray()
             try:
                 dev.send_raw(pkt)
             except usb1.USBError as e:
@@ -656,8 +728,10 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         def _arm():
             dev.write_reg(dev.AD_HOST, 0x84, b'\x02'); dev.write2(dev.AD_PICL_PLUS, 0x8a)
 
+        exp_base = [0x03d6]                                # reg0x82 base field (F-135: 1858, set below)
+
         def _set(e):                                       # e = [eR, eG, eB] per-channel exposure (build_exposure args)
-            dev.write_reg(dev.AD_PICL_PLUS, 0x82, build_exposure(e[0], e[1], e[2])); _arm()
+            dev.write_reg(dev.AD_PICL_PLUS, 0x82, build_exposure(e[0], e[1], e[2], base=exp_base[0])); _arm()
 
         def _grab(nlines, timeout=4.0):
             """Capture nlines off EP6, MARKER-ALIGN (bit0 line-sync), deinterleave -> 3 per-phase planes.
@@ -680,8 +754,9 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             m = arr[ph: ph + ((len(arr) - ph) // LINE_S) * LINE_S]
             if len(m) < LINE_S:
                 return None
-            lines = m.reshape(-1, LINE_S).astype(np.float32)
-            return [lines[:, c::3] for c in range(3)]      # 3 planes, each (nlines, 2000)
+            vis = LINE_S - (LINE_S % 3)                # drop pad samples
+            lines = m.reshape(-1, LINE_S)[:, :vis].astype(np.float32)
+            return [lines[:, c::3] for c in range(3)]      # 3 planes, each (nlines, vis//3)
 
         def _levels(nlines=48):
             pl = _grab(nlines)
@@ -723,7 +798,7 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         # film/no-film signal meaningful -> the prerequisite for OEM-faithful end-of-film + §2d-4.
         # ============================================================================================
         if dx_calibrate:
-            DXA = 0x40
+            DXA = dev.AD_PICL_PLUS
             def _beat():
                 try:
                     dev.poll_status(dev.AD_HOST)
@@ -793,7 +868,7 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         # film-edge standard is the next step.
         # ============================================================================================
         if dx_codes:
-            DXA = 0x40
+            DXA = dev.AD_PICL_PLUS
             def _beat():
                 try:
                     dev.poll_status(dev.AD_HOST)
@@ -851,9 +926,26 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         # currents to the CEILINGS (coarse, full LED drive), then servo the DUTY (fine). At max current the
         # duty needed stays UNDER the reg0x82 wrap (~1000) — which is exactly why duty-alone (low current)
         # wrapped before and this won't.
+        #
+        # PER-MODEL light handling:
+        #   F-135+ (is_plus): CUR=(8,20,20) + duty servo — psix's HW-validated operating
+        #     points on the reference Plus unit.
+        #   F-135: FIXED exposure from the OEM USB capture (F135_* above) — the OEM's own
+        #     in-scan servo nudges IR duty by ±1/step, i.e. it runs effectively fixed too.
+        #     (The registry lightcal's units don't map to these registers — measured
+        #     2026-08-25; don't resurrect it. Never sweep/probe LED currents.)
+        is_plus = getattr(dev, 'is_plus', True)
         TARGET, DUTY_WRAP = 0xf000, 900
-        CUR = (8, 20, 20)                                  # R/G/B current ceilings (model 'D')
+        CUR = (8, 20, 20) if is_plus else F135_CURRENTS
         exp = [40, 40, 40]                                 # start low (no clip at max current), servo up
+        oem = None
+        if not is_plus:
+            oem = {'exp': list(F135_EXP), 'film': list(F135_EXP),
+                   'base': F135_EXP_BASE, 'ir_duty': F135_IR_DUTY}
+            exp_base[0] = F135_EXP_BASE
+            print("  >>> F-135: OEM-capture exposure (currents R/G/B=%d/%d/%d, "
+                  "base %d, IR duty %d); open gate via servo, film duty fixed %d/%d/%d."
+                  % (*CUR, F135_EXP_BASE, F135_IR_DUTY, *F135_EXP))
         if ir:
             # IR OPEN-GATE EXPOSURE SERVO (from the ir_scanstart packet map). PICL+
             # reg0x82 LED exposure = [duty_b, duty_ir, duty_r, 0, duty_g, base] (6×u16). The OEM scan-start
@@ -868,12 +960,31 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             # roll5: open-gate servo reached 0xf000 but the neg stayed ~half-level/29% crushed, identical to
             # roll4 — because IR mode integrates LESS light PER LINE; the real exposure lever is the IR
             # motor/line-rate, NOT reg0x82 duty). So keep the OEM-faithful values here.
-            IRP = 2000 * 4
+            IRP = LINE_S                                    # detected line samples (8000 Plus / 7880 F-135)
+            IR_RGB_SAMPLES = 6000 if is_plus else 5910      # visible samples per line
             IR_DUTY, EXP_BASE, OPEN_TGT = 0x01df, 0x0257, 0xd000
             FILM_RGB = (0x0216, 0x0255, 0x01a5)             # OEM film duty (r,g,b); RGB well-exposed on film
             exp = [0x017f, 0x00ef, 0x0053]                  # start at the OEM converged open-gate duty (r,g,b)
-            print("\n  >>> IR scan: servoing RGB duty on the open gate (IR duty 0x%03x HELD, target 0x%04x)..." % (IR_DUTY, OPEN_TGT))
-            servo_ok = False
+            if not is_plus:
+                # F-135 IR: fixed exposure from the OEM IR capture (scan_fullroll.pakscan:
+                # duties B=278 IR=1352 R=895 G=707, base 1858, currents B3 IR2 R2 G3). The
+                # OEM's own in-scan servo nudges IR duty by +-1 — effectively fixed.
+                IR_DUTY = F135_IR_DUTY
+                EXP_BASE = F135_EXP_BASE
+                FILM_RGB = tuple(F135_EXP)
+                exp = list(F135_EXP)
+                dev.write_reg(dev.AD_PICL_PLUS, 0x81, build_current(2, 3, 3, ir=F135_CURRENT_IR)); _arm()
+                print("\n  >>> F-135 IR: OEM-capture fixed exposure (currents R/G/B/IR=2/3/3/2, "
+                      "duty R/G/B=%d/%d/%d, IR %d, base %d) — no servo." % (*F135_EXP, F135_IR_DUTY, F135_EXP_BASE))
+                servo_ok = True
+            else:
+                print("\n  >>> IR scan: servoing RGB duty on the open gate (IR duty 0x%03x HELD, target 0x%04x)..."
+                      % (IR_DUTY, OPEN_TGT))
+                servo_ok = False
+            for it in range(8 if not (not is_plus) else 1):
+                if not is_plus:
+                    break                                   # fixed OEM exposure — nothing to converge
+                dev.write_reg(dev.AD_PICL_PLUS, 0x82, build_exposure(exp[0], exp[1], exp[2], base=EXP_BASE, ir=IR_DUTY)); _arm()
             for it in range(8):
                 dev.write_reg(dev.AD_PICL_PLUS, 0x82, build_exposure(exp[0], exp[1], exp[2], base=EXP_BASE, ir=IR_DUTY)); _arm()
                 time.sleep(0.05)
@@ -905,8 +1016,8 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                 arr = np.frombuffer(gbuf, dtype='<u2'); mkk = np.flatnonzero(arr & 1)
                 wph = int(np.bincount(mkk % IRP, minlength=IRP).argmax())
                 wl = arr[wph: wph + ((len(arr) - wph) // IRP) * IRP].reshape(-1, IRP).astype(np.float32)
-                wrgb = np.stack([wl[:, :6000][:, c::3].mean(axis=0) for c in range(3)])
-                wir = wl[:, 6000:8000].mean(axis=0)
+                wrgb = np.stack([wl[:, :IR_RGB_SAMPLES][:, c::3].mean(axis=0) for c in range(3)])
+                wir = wl[:, IR_RGB_SAMPLES:IRP].mean(axis=0)
                 sidecar = os.path.splitext(out_path)[0] + '_flatref.npz'
                 dk = {}                                     # §2b measured dark (lamp-off pass); flat fallback if absent
                 if dark_ref[0] is not None:
@@ -958,7 +1069,16 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             print("  >>> reuse a prior empty-gate _flatref.npz at decode (--flatfield <prior>_flatref.npz).")
         else:
             dev.write_reg(dev.AD_PICL_PLUS, 0x81, build_current(*CUR)); _arm()
-            print("\n  >>> LED currents -> ceilings reg0x81 R=%d G=%d B=%d (coarse). Servoing duty..." % CUR)
+            if oem:
+                # F-135 film duties ~850: BELOW the wrap-edge instability (duty ~900
+                # flickers common-mode on all channels — measured rolls 9/10), with the
+                # orange-mask boost from CURRENT at the vendor ceiling instead.
+                # (Plus-tuned film_boost must NOT multiply here: it overexposed roll 8.)
+                film_duty = [850, 850, 850]
+                print("\n  >>> LED currents -> reg0x81 R=%d G=%d B=%d. Servoing the open gate; "
+                      "film duty R/G/B=%d/%d/%d + G/B current boost." % (*CUR, *film_duty))
+            else:
+                print("\n  >>> LED currents -> reg0x81 R=%d G=%d B=%d (coarse). Servoing duty..." % CUR)
         if exp_servo and not ir and fixed_duty is None:
             for it in range(16):
                 _set(exp); time.sleep(0.05)
@@ -976,8 +1096,8 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                 if done:
                     break
             _set(exp)
-            print("  >>> open-gate duty: R=%d G=%d B=%d (currents R8/G20/B20, target 0x%04x)"
-                  % (exp[0], exp[1], exp[2], TARGET))
+            print("  >>> open-gate duty: R=%d G=%d B=%d (currents R/G/B=%d/%d/%d, target 0x%04x)"
+                  % (*exp, *CUR, TARGET))
 
         # ---- OPEN-GATE WHITE REFERENCE for the flat-field, at the converged per-channel exposure ----
         # pakon_decode uses the per-column per-channel mean as the white reference -> gain[col]=
@@ -987,6 +1107,7 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         if not ir and fixed_duty is None:
             print("\n  >>> capturing open-gate WHITE reference for flat-field...")
             exp_open = list(exp)
+            _detect_line_period()                          # re-measure on TRANSPORT-format lines
             try:
                 pl = _grab(256, timeout=6.0)
                 if pl is None:
@@ -1007,20 +1128,42 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                     exp_film = [max(1, min(DUTY_WRAP, int(round(exp_open[c] * film_boost[c])))) for c in range(3)]
                 sidecar = os.path.splitext(out_path)[0] + '_flatref.npz'
                 extra = {'dark': dark_ref[0]} if dark_ref[0] is not None else {}   # §2b measured dark
+                # GATE-NOT-EMPTY GUARD: the white ref is only valid with an EMPTY gate. Film in the
+                # slot at scan start (psix had no eject/rewind; now it does — Settings page) yields a
+                # "white" barely above the dark floor; using it would poison the flat-field AND arm
+                # end-of-film at a film-brightness level (EOF would never fire).
+                wmean = float(np.mean([white[c].mean() for c in range(3)]))
+                dlvl = float(dark_ref[0].mean()) if dark_ref[0] is not None else 1500.0
+                gate_empty = wmean > dlvl + 8000.0
                 np.savez(sidecar, white=white, exp_open=np.array(exp_open), exp_film=np.array(exp_film),
                          cur=np.array(CUR), **extra)
                 print("  >>> WHITE reference saved: %s (%d lines, per-col mean R/G/B=%.0f/%.0f/%.0f)%s"
                       % (sidecar, pl[0].shape[0], white[0].mean(), white[1].mean(), white[2].mean(),
                          "  +DARK" if dark_ref[0] is not None else "  (dark self-derived)"))
-                if exp_film != exp_open:
+                if not gate_empty:
+                    print("  >>> !! GATE NOT EMPTY: white ref is only %.0f (dark %.0f) — film is in the"
+                          " slot. The flat-field and end-of-film reference are INVALID. Eject or rewind"
+                          " the film (Settings page) and rescan with an empty gate; EOF falls back to"
+                          " the safety timeout." % (wmean, dlvl))
+                if exp_film != exp_open or oem:
+                    if oem:
+                        # F-135: the orange-mask boost comes from CURRENT at the board
+                        # ceiling (G/B 8 of 8; R stays low — the mask passes red).
+                        # Boost vs open gate ~= x0.95/4.95/8.0 at duty 850 — the Plus
+                        # film_boost ratios, reached without entering the duty-900
+                        # flicker zone.
+                        dev.write_reg(dev.AD_PICL_PLUS, 0x81, build_current(2, 8, 8)); _arm()
+                        print("  >>> FILM currents -> reg0x81 R=2 G=8 B=8 (orange-mask comp "
+                              "via current; duties %d/%d/%d)" % tuple(exp_film))
                     _set(exp_film)
                     print("  >>> FILM exposure boost (orange-mask comp): R=%d G=%d B=%d (open-gate was %d/%d/%d)"
                           % (exp_film[0], exp_film[1], exp_film[2], exp_open[0], exp_open[1], exp_open[2]))
                 # OPEN-GATE brightness at the FILM exposure = the end-of-film reference.
                 # White is measured at exp_open; the empty gate at exp_film scales by exp_film/exp_open (clamped).
-                og = [min(65535.0, float(white[c].mean()) * exp_film[c] / max(exp_open[c], 1)) for c in range(3)]
-                img['og'] = float(np.mean(og))
-                print("  >>> open-gate level @ film exposure ~%.0f (end-of-film = image returns near it)" % img['og'])
+                if gate_empty:
+                    og = [min(65535.0, float(white[c].mean()) * exp_film[c] / max(exp_open[c], 1)) for c in range(3)]
+                    img['og'] = float(np.mean(og))
+                    print("  >>> open-gate level @ film exposure ~%.0f (end-of-film = image returns near it)" % img['og'])
                 print("      decode with:  pakon_decode.py %s --flatfield %s" % (out_path, sidecar))
             except Exception as e:
                 print("  WARNING: white-reference / film-exposure setup failed (%s) — decode with --flatfield auto." % e)
@@ -1049,7 +1192,7 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         # Stop = the chosen signal CLEAR/exit SUSTAINED dx_gap s after film was engaged (== i_uiNoFilmTimeOut;
         # must exceed an inter-frame clear gap). Dark-frame + safety timeout remain as backstops.
         # Set the DX pots so the TopClock fallback swings; always LOGS the sensors.
-        dx_addr = 0x40
+        dx_addr = dev.AD_PICL_PLUS
         DX_FILM, DX_CLEAR = 80, 120                       # TopClock: <80 = film present; >120 = clear/no-film
         if dx_eof and not ir:
             try:
@@ -1062,8 +1205,16 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
         dx_clear_since = None
         dx90_film_seen = False          # OEM reg0x90 header&0x30 CLEAR = film present (only live if DX-calibrated)
         dx90_exit_since = None          # reg0x90 header&0x30 SET (DX-exit) after film was present
+        # ---- OEM scan-time SERVICING: the light controller raises service flags
+        # (reg0x02 bit7) during the scan and the OEM acks them via reg0x06 with the
+        # status's low bits (capture: acks 0020/0002/0004 spread across transport).
+        # psix never acked mid-scan; unacked flags are a candidate cause of the
+        # wide-window readout instability.
+        svc_last = 0.0
         # PRIMARY end-of-film (image-based, OEM green-band semantics):
         gate_filled = False             # image mean dropped INTO the film band (gate filled with film)
+        film_vals = []                  # running stream-mean sample (relative-EOF baseline)
+        last_base_t = 0.0
         bright_since = None             # image mean RETURNED to ~open-gate brightness (film-end) since this t
         ejecting_until = None           # drive-to-eject deadline: keep motor running to clear the tail past the exit
         # ---- DX-CODE LOGGING during the full scan (lamp ON + arm-pulse train = the OEM ScanPictures
@@ -1139,20 +1290,51 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             #     a DX-calibrated unit makes it live (it never trips on our frozen-0x3c unit).
             eof = False
             if dx_eof and ejecting_until is None:
-                og_level = img['og'] or 65535.0            # measured open-gate@film; else assume saturation
-                FILL_LVL = 0.80 * og_level                 # gate filled with film (mean clearly below open-gate)
-                BRIGHT_LVL = 0.92 * og_level               # gate empty / film-end (mean back near open-gate)
-                if img['mean'] < FILL_LVL:
-                    gate_filled = True; bright_since = None
-                elif gate_filled and img['mean'] >= BRIGHT_LVL:
-                    bright_since = bright_since or now
-                if gate_filled and bright_since is not None and (now - bright_since) > dx_gap:
-                    reason = "end-of-film(open-gate return %.1fs)" % dx_gap
-                    print("  >>> END OF FILM: image returned to open-gate brightness (mean %.0f >= %.0f, "
-                          "sustained %.1fs)." % (img['mean'], BRIGHT_LVL, dx_gap)); eof = True
-                elif dx90_film_seen and dx90_exit_since is not None and (now - dx90_exit_since) > dx_gap:
+                if img['og'] is not None:
+                    # (a) PRIMARY (og valid): open-gate return, OEM green-band
+                    og_level = img['og']
+                    FILL_LVL = 0.80 * og_level
+                    BRIGHT_LVL = 0.92 * og_level
+                    if img['mean'] < FILL_LVL:
+                        gate_filled = True; bright_since = None
+                    elif gate_filled and img['mean'] >= BRIGHT_LVL:
+                        bright_since = bright_since or now
+                    if gate_filled and bright_since is not None and (now - bright_since) > dx_gap:
+                        reason = "end-of-film(open-gate return %.1fs)" % dx_gap
+                        print("  >>> END OF FILM: image returned to open-gate brightness (mean %.0f >= %.0f, "
+                              "sustained %.1fs)." % (img['mean'], BRIGHT_LVL, dx_gap)); eof = True
+                else:
+                    # (a') og INVALID (white ref failed/clipped): relative EOF — the film
+                    # baseline is the running median of the stream mean; the end = the mean
+                    # jumps clearly above it (gate emptied) and stays there.
+                    if now - last_base_t > 0.25:
+                        last_base_t = now
+                        film_vals.append(img['mean'])
+                        if len(film_vals) > 600:
+                            del film_vals[:-600]
+                    if len(film_vals) > 20:
+                        base = float(np.median(film_vals))
+                        if not gate_filled and img['mean'] < 0.6 * base:
+                            gate_filled = True; bright_since = None
+                        elif gate_filled and img['mean'] > 1.8 * base:
+                            bright_since = bright_since or now
+                        else:
+                            bright_since = None
+                        if gate_filled and bright_since is not None and (now - bright_since) > dx_gap:
+                            reason = "end-of-film(relative: mean %.0f > 1.8x film baseline %.0f, %.1fs)" \
+                                     % (img['mean'], base, dx_gap)
+                            print("  >>> END OF FILM: image rose above the film baseline "
+                                  "(mean %.0f > 1.8 x %.0f, sustained %.1fs)." % (img['mean'], base, dx_gap))
+                            eof = True
+                # (b) OEM reg0x90 DX-exit (only live on a DX-calibrated unit)
+                if not eof and dx90_film_seen and dx90_exit_since is not None and (now - dx90_exit_since) > dx_gap:
                     reason = "end-of-film(OEM reg0x90 DX-exit %.1fs)" % dx_gap
                     print("  >>> END OF FILM via OEM reg0x90 header&0x30 DX-exit (sustained %.1fs)." % dx_gap); eof = True
+                # (c) TopClock: LOGGING ONLY. On the F-135 unit it reads CLEAR mid-roll
+                # while film is demonstrably in the gate (image mean film-level), and
+                # firing EOF on it terminated a roll after 2 frames (2026-08-25). The
+                # sensor's optical path evidently sits beside/below the film edge.
+                # Its live values are still printed for diagnostics.
             # DRIVE-TO-EJECT: the sensor/gate is UPSTREAM of the film exit, so keep the motor running forward
             # `eject_seconds` more to push the tail fully out, THEN stop (instead of cutting it mid-path).
             if eof:
@@ -1167,10 +1349,20 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             if ejecting_until is not None and now >= ejecting_until:
                 print("  >>> eject drive complete — stopping motor (film should be clear of the gate).")
                 break
-            try:
-                dev.poll_status(dev.AD_HOST)            # flow-control heartbeat
-            except usb1.USBError:
-                pass
+                try:
+                    dev.poll_status(dev.AD_HOST)            # flow-control heartbeat
+                except usb1.USBError:
+                    pass
+                # OEM scan-time servicing (see note above): ack the light controller's
+                # service flag when raised. ~2 Hz poll; ack only on bit7.
+                if now - svc_last > 0.5:
+                    svc_last = now
+                    try:
+                        st = dev.read_reg(dev.AD_PICL_PLUS, 0x02, 2, retries=1)
+                        if len(st) >= 1 and (st[0] & 0x80):
+                            dev.write_reg(dev.AD_PICL_PLUS, 0x06, bytes([0x00, st[0] & 0x7f]))
+                    except (PakonError, usb1.USBError):
+                        pass
             dev.ctx.handleEventsTimeout(pump)
         _emit('phase', {'phase': 'stopping', 'message': 'stopping motor + teardown',
                         'bytes': img['bytes'], 'reason': reason})
@@ -1237,6 +1429,28 @@ def run_transport_scan(dev, out_path, *, ir=False, seconds=300.0, on_progress=No
         else:
             print("  >>> SCAN-START: full captured sequence (%s) incl. reactive servo-seeds (PSIX_SCANSTART_FULL)."
                   % ("IR" if ir else "3ch"))
-        steps = pakon_scanstart.build_scanstart_steps(ir=ir, known_only=ko, capture_path=scanstart_path)
+        steps = pakon_scanstart.build_scanstart_steps(
+            ir=ir, known_only=ko, capture_path=scanstart_path,
+            light=getattr(dev, 'AD_PICL_PLUS', pakon_scanstart.PICL_PLUS),
+            motor=getattr(dev, 'AD_SUB', pakon_scanstart.SUB44))
+        if getattr(dev, 'is_plus', True) is False:
+            # The scan-start's transport rate is the Plus capture's (0x1726=5926). On a base
+            # F-135 the OEM derives it from the unit's EEPROM: MotorSpeed scaled by the
+            # motor-adjust words (verified: 1569*1000/1008 -> 1557, the capture's rate).
+            from . import unitdata as pakon_unitdata
+            ms = pakon_unitdata.transport_rate(getattr(dev, 'unit_info', None), ir=ir)
+            if ms is None:
+                ms = 1557 if ir else 2364            # OEM-capture / derived fallbacks
+            lo, hi = ms & 0xff, (ms >> 8) & 0xff
+            n = 0
+            for s in steps:
+                b = bytearray(bytes.fromhex(s['data']))
+                if len(b) >= 7 and b[0] == 2 and b[2] == dev.AD_SUB and b[3] == 2 and b[4] == 0xa5:
+                    b[5], b[6] = lo, hi
+                    s['data'] = bytes(b).hex()
+                    n += 1
+            if n:
+                print("  >>> motor rate: %d (0x%04x) from the unit's EEPROM words "
+                      "(replaces the Plus-captured rate in %d packet(s))" % (ms, ms, n))
     return transport(dev, steps, out_path, seconds, max_mb << 20, pump,
                      ir=ir, on_progress=on_progress, **transport_kw)

@@ -49,6 +49,7 @@ def p_write2(addr, reg):       return bytes([4, 3, addr, 0x00, reg & 0xff])
 #   visible (dev17_scanstart): trigger 3c0001, lamp 01,        rate 0x1726
 #   IR/4ch  (ir_scanstart):    trigger 310001, lamp 01/02/03,  rate 0x12fa, IR exposure field populated
 TRIGGER = (0x3c, 0x00, 0x01)            # reg0x91 CCD read-pass start (resets line counter); both triggers
+F135_TRIGGER = b'\x10\x00\x01'          # reg0x91 trigger word on an F-135 (OEM capture; both modes)
 LAMP_ON = (0x01,)                       # reg0x80 bit0=visible R/G/B, bit1=IR
 SVC_ACK = (0x00, 0x02)                  # reg0x06 service-ack (emit only if reg0x02 header bit0x80 set)
 MOTOR_RATE = 0x1726                     # reg0xa5 transport rate (5926; film clamp 400..0x251c)
@@ -224,7 +225,37 @@ def build_abort_steps():
     return s
 
 
-def build_scanstart_steps(ir=False, assert_clean=True, capture_path=None, known_only=False):
+def remap_steps(steps, light=PICL_PLUS, motor=SUB44, ir=False):
+    """Rewrite built steps from the Plus addressing/values to another generation's.
+    The same command set applies to both generations — the addresses differ
+    (byte[2]), and on an F-135 the trigger word (reg0x91 payload), the scan
+    window end (idx5) and the scan-time CCD integration (idx6, which the Plus
+    sequence never writes) differ, per the OEM F-135 capture. Identity for Plus."""
+    if (light, motor) == (PICL_PLUS, SUB44) and not ir:
+        return steps
+    amap = {PICL_PLUS: light, SUB44: motor}
+    out = []
+    for s in steps:
+        b = bytearray(bytes.fromhex(s['data']))
+        b[2] = amap.get(b[2], b[2])
+        if ir and b[0] == 2 and len(b) == 8 and b[4] == 0x82 and b[5] == 0x00:
+            v = b[6] | (b[7] << 8)
+            if v in (0x60, 0x61):              # IR mode: enable-mask bit 0x100 adds the
+                nv = v | 0x100                 # IR block to the line ([RGB 5910][IR ~1968])
+                b[6], b[7] = nv & 0xff, (nv >> 8) & 0xff
+        if b[0] == 2 and len(b) >= 8 and b[4] == 0x91:
+            b[5:8] = F135_TRIGGER                      # OEM F-135 trigger word
+        # NOTE: idx5 stays at the Plus value (0x819 = 2073): pakon-reference
+        # image-stream.md documents base16 = 2000px visible width, and the idx5=2043
+        # seen in one F-135 capture yields a 1970px window — 30px narrow. With 2073
+        # the 3-ch line is 6000 samples (2000px) and the IR line is 8000 (2000px x4),
+        # matching the documented geometry exactly.
+        out.append({**s, 'data': bytes(b).hex()})
+    return out
+
+
+def build_scanstart_steps(ir=False, assert_clean=True, capture_path=None, known_only=False,
+                          light=PICL_PLUS, motor=SUB44):
     """Build transport()'s scan-start.
 
     Default: the IN-CODE sequence (_scanstart_seq.SCANSTART_3CH / SCANSTART_IR — no file loaded). Every
@@ -238,7 +269,9 @@ def build_scanstart_steps(ir=False, assert_clean=True, capture_path=None, known_
     produces them. So the scanner is sent only surely-known values. Works for 3ch AND IR (the DET set carries
     the variant scalars: trigger 310001, lamp 03/02, rate 0x12fa, 4-ch geometry). ⚠ This sends a never-tested
     handshake — VALIDATE on a no-film/empty-gate run before relying on it (motor spins free, no film => no
-    stick risk). `capture_path` (debug only) replays a json file instead."""
+    stick risk). `capture_path` (debug only) replays a json file instead.
+    `light`/`motor` retarget the built packets' bus addresses (default = the Plus 0x40/0x44;
+    pass an F-135's 0x20/0x24 for that generation — same commands, different addresses)."""
     if capture_path is not None:                                     # debug override: replay a json capture
         d = json.load(open(capture_path))
         raw = d['sequence'] if isinstance(d, dict) and 'sequence' in d else d
@@ -263,7 +296,7 @@ def build_scanstart_steps(ir=False, assert_clean=True, capture_path=None, known_
             raise ValueError('scan-start: expected 2 identical reg0x91 triggers, got %r' % triggers)
     if known_only:                                             # drop the reactive SEEDS -> servo makes them live
         out = [s for s in out if s['verdict'] == DET]
-    return out
+    return remap_steps(out, light, motor, ir=ir)
 
 
 def cmd_classify(pkts, path=SCANSTART):

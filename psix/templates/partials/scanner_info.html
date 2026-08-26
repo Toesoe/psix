@@ -6,7 +6,7 @@
       <dt>Serial</dt><dd>{{ status.info.serial_picl }}</dd>
       <dt>State</dt><dd>{{ status.info.state }}</dd>
     </dl>
-    <p class="info-empty" style="margin-top:10px;">No real hardware — switch to <strong>Hardware</strong> below to connect a Pakon F135+.</p>
+    <p class="info-empty" style="margin-top:10px;">No real hardware — switch to <strong>Hardware</strong> below to connect a Pakon F135 or F135+.</p>
   </div>
 {% else %}
   {% if status.phase == 'firmware_missing' %}
@@ -52,6 +52,12 @@
         <dt>Serial (sub)</dt><dd>{{ status.info.serial_sub or '—' }}</dd>
         <dt>EEPROM</dt><dd>{{ status.info.eeprom_bytes }} bytes</dd>
       </dl>
+      <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn" data-action="film-eject" title="Run the motor forward (no lamp, no scan) to push the film out">Eject film ▸</button>
+        <button type="button" class="btn" data-action="film-rewind" title="Run the motor in reverse (no lamp, no scan)">◂ Rewind film</button>
+        <span class="fw-drop-hint" id="film-status"></span>
+      </div>
+      <p class="info-empty" style="margin-top:6px;">Motor-only transport (no lamp). Use before a scan so the gate is empty for the white reference.</p>
     {% else %}
       <p class="info-empty">{{ status.error or 'Not connected — press Connect.' }}</p>
     {% endif %}

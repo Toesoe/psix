@@ -436,6 +436,26 @@
     if (!el) return;
     var action = el.dataset.action;
     if (action === "connect") { ev.preventDefault(); connectScanner(); }
+    else if (action === "film-eject" || action === "film-rewind") {
+      ev.preventDefault();
+      var btn = el;
+      var stat = $("#film-status");
+      btn.disabled = true;
+      if (stat) stat.textContent = "moving film…";
+      jsonFetch("/api/scanner/film", {
+        method: "POST",
+        body: { action: action === "film-eject" ? "eject" : "rewind", seconds: 15 }
+      })
+        .then(function (r) {
+          if (stat) stat.textContent = r.moved ? "done" : "no move";
+          toast(action === "film-eject" ? "Eject finished" : "Rewind finished", "ok");
+        })
+        .catch(function (err) {
+          if (stat) stat.textContent = "";
+          toast("Film move failed: " + err.message, "err");
+        })
+        .finally(function () { btn.disabled = false; });
+    }
     else if (action === "scan-roll") {
       ev.preventDefault();
       var ir = $("#ir-toggle") && $("#ir-toggle").checked;

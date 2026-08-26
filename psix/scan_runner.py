@@ -309,7 +309,7 @@ class ScanRunner:
         m = ir_min_size if ir_min_size is not None else ice.get("ir_min_size")
         names, _ = processing.develop_previews(
             self.driver, out_path, flatref, self.rolls.neg_dir(roll),
-            self.rolls.preview_dir(roll), base, grade=None,
+            self.rolls.preview_dir(roll), base, grade=None, ir=roll.get("ir"),
             on_event=self._on_event, ir_thresh=t, ir_kernel=k, ir_min_size=m)
         return names
 

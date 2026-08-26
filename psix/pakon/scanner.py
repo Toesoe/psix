@@ -48,6 +48,12 @@ class State(enum.Enum):
 
 # Readiness / status aggregation. Model 'D' polls these subsystems.
 READY_SUBSYS = (PakonDevice.AD_PICL_PLUS, PakonDevice.AD_SUB, 0x28)  # PICL+, sub44, sub28
+
+
+def _ready_subsys(dev):
+    """The subsystem set for THIS device's generation (F-135: PICL 0x20/PICM 0x24;
+    F-135+: PICL+ 0x40/PICM+ 0x44), plus sub28."""
+    return (dev.AD_PICL_PLUS, dev.AD_SUB, 0x28)
 FAULT_MASK = 0x5f5fbff       # OEM any-fault mask over the aggregated status word
 READY_BIT = 0x80             # HOST reg0x02 bit7 = ready/service signal
 BUSY_BIT = 0x01              # reg0x02 bit0 = busy
@@ -61,6 +67,7 @@ class PakonScanner:
         self.state = State.CLOSED
         self.verbose = verbose
         self.eeprom = None              # raw EEPROM bytes read during initialize() (LED cal etc.)
+        self.unit_info = None           # decoded per-unit EEPROM (type/serial/offsets/speeds)
         self.init_anomalies = []
         self.first_fault = None         # latched first fault (mirrors the OEM error handler)
         self.last_status = None         # last HOST reg0x02 status byte
@@ -94,13 +101,44 @@ class PakonScanner:
             d = self.dev.handle.getDevice()
             print("opened %04x:%04x bus%d addr%d"
                   % (libpakon.VID, libpakon.PID_LOADED, d.getBusNumber(), d.getDeviceAddress()))
+            print("  [model] %s (light=0x%02x motor=0x%02x)"
+                  % (getattr(self.dev, 'model', '?'),
+                     getattr(self.dev, 'AD_PICL_PLUS', 0), getattr(self.dev, 'AD_SUB', 0)))
         return self
 
     def initialize(self):
-        """OPEN -> READY: run the reconstructed InitializeScanner, then wait for ready."""
+        """OPEN -> READY: run the reconstructed InitializeScanner, then wait for ready.
+        The per-unit EEPROM is read FIRST so the init geometry (CCD window start/end,
+        integration) can come from the unit's own calibration words."""
         self._require(State.OPEN, State.FAULT)
-        seq = pakon_initseq.build_init_steps()
-        self.eeprom, self.init_anomalies = pakon_initseq.run_steps(self.dev, seq, self.verbose)
+        dev = self.dev
+        from . import unitdata as pakon_unitdata
+        # pass 1: EEPROM only (the OEM's own A4/A9 reads; safe to repeat)
+        self.eeprom, _ = pakon_initseq.run_steps(
+            dev, pakon_initseq.eeprom_steps((0x18e, 0x24)), self.verbose)
+        self.unit_info = pakon_unitdata.parse(self.eeprom)
+        dev.unit_info = self.unit_info
+        if self.verbose:
+            print("  " + pakon_unitdata.describe(self.unit_info))
+        # the EEPROM scanner type is the authoritative model (1350=F-135, 1351=F-135+)
+        m = self.unit_info and self.unit_info.get('model')
+        if m and m != dev.model:
+            print("  [model] WARNING: presence probes said %s but EEPROM says %s — trusting EEPROM"
+                  % (dev.model, m))
+            dev.model = m
+            dev.is_plus = (m == 'F135+')
+            if not dev.is_plus:
+                dev.AD_PICL_PLUS = dev.AD_PICL
+                dev.AD_SUB = dev.AD_PICM
+        is_plus = getattr(dev, 'is_plus', True)
+        # NOTE: init geometry stays at the OEM defaults (62/2062/0xffd) on BOTH
+        # generations — verified against the OEM F-135 capture. The per-unit EEPROM
+        # Offset is NOT written to idx4 here (that inference was falsified: with
+        # per-unit geometry at init the scanner never reaches ready). Scan-time
+        # geometry (idx5 end, idx6 integration) is applied by the scan-start remap.
+        seq = pakon_initseq.build_init_steps(light=dev.AD_PICL_PLUS, motor=dev.AD_SUB,
+                                             tec=is_plus)
+        self.eeprom, self.init_anomalies = pakon_initseq.run_steps(dev, seq, self.verbose)
         if self.verbose:
             print("  init: %d steps, EEPROM %d B, %d anomalies"
                   % (len(seq), len(self.eeprom), len(self.init_anomalies)))
@@ -150,7 +188,7 @@ class PakonScanner:
         status query (Type-1 reg0x02 reads need the OEM poll context); bit0=busy, bit7=service.
         Advisory health info, not a fault verdict."""
         per = {}
-        for addr in READY_SUBSYS:
+        for addr in (_ready_subsys(self.dev) if self.dev else READY_SUBSYS):
             try:
                 per[addr] = self.dev.poll_status(addr)
             except (PakonError, usb1.USBError):
@@ -191,6 +229,7 @@ class PakonScanner:
 
         return {
             'state': self.state.value,
+            'model': getattr(self.dev, 'model', None),
             'host_status': None if host is None else '0x%02x' % host,
             'ready': bool(host is not None and (host & READY_BIT)),
             'subsystems': {hex(a): (None if v is None else '0x%02x' % v) for a, v in per.items()},

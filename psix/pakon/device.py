@@ -11,7 +11,11 @@ Command protocol (verified against a live USB capture):
           2 WRITE  [count, reg, <val bytes>] -> resp [0x07, 0x02, addr, status]   (0x07=write-ack)
           3 POLL   [] (address only)         -> resp [0x03, 0x02, addr, status]
           4 WRITE2 [0x00, val]               -> resp [0x07, 0x02, addr, status]
-  Addresses: 0x10 AD_HOST, 0x20 AD_PICL, 0x40 AD_PICL_PLUS, 0x44 sub-board.
+  Addresses: 0x10 AD_HOST, 0x20/0x24 PICL/PICM (F-135), 0x40/0x44 PICL+/PICM+ (F-135+).
+  The F-135 and F-135+ are USB-identical; the generation is detected by presence
+  probes after the bridge open handshake (the OEM's own model detection) and the
+  detected addresses are set per instance as AD_PICL_PLUS (light/CCD) and
+  AD_SUB (motor), so callers are generation-agnostic.
 
 This module is pure transport: register read/write/poll + raw replay + EP6 async
 image streaming. Scan sequencing/poll-until-ready logic lives one layer up.
@@ -38,9 +42,10 @@ class PakonDevice:
     RESP_MAX = 64                # driver used a 64-byte response buffer
 
     AD_HOST = 0x10
-    AD_PICL = 0x20
-    AD_PICL_PLUS = 0x40
-    AD_SUB = 0x44
+    AD_PICL = 0x20                # F-135 light/CCD controller
+    AD_PICM = 0x24                # F-135 motor controller
+    AD_PICL_PLUS = 0x40           # F-135+ light/CCD controller (default)
+    AD_SUB = 0x44                 # F-135+ motor controller (default)
 
     RESP_READ = 0x01
     RESP_POLL = 0x03
@@ -51,6 +56,9 @@ class PakonDevice:
         self.ctx.open()
         self.handle = None
         self._lock = threading.RLock()   # serialize EP1 command transactions (driver's crit-section)
+        # generation (set by open() -> detect_model(); defaults = F-135+)
+        self.model = 'F135+'
+        self.is_plus = True
 
     # ---- lifecycle -------------------------------------------------------
     def open(self):
@@ -63,7 +71,65 @@ class PakonDevice:
         except usb1.USBError:
             pass
         self.handle.claimInterface(0)
+        self.detect_model()
         return self
+
+    def _probe_present(self, addr, timeout=600):
+        """OEM presence probe — the open-handshake frame the OEM driver uses for
+        model detection: a Type-4 CMD [00 00] to the candidate address, answered by
+        an ACK `07 02 <addr> <status>` (0x00 = present, 0x01 = absent). Falls back
+        to a Type-3 status POLL if the CMD gets no recognisable ACK. Any error or
+        timeout counts as absent."""
+        try:
+            r = self.transact(4, addr, b'\x00\x00', timeout=timeout)
+            if len(r) >= 4 and r[0] == self.RESP_WRITE_ACK:
+                return r[3] == 0x00
+        except Exception:                # noqa: BLE001 — timeout/stall = treat as absent
+            return False
+        try:
+            r = self.transact(3, addr, b'', timeout=timeout)
+        except Exception:                # noqa: BLE001
+            return False
+        return len(r) >= 4 and r[0] == self.RESP_POLL and r[3] == 0x00
+
+    def detect_model(self, verbose=False):
+        """Detect the scanner generation and bind AD_PICL_PLUS / AD_SUB to the
+        addresses that actually answer. The F-135 and F-135+ are indistinguishable
+        over USB; the OEM's own model detection is exactly this: probe each
+        candidate controller address after the bridge open handshake (HostReset +
+        HostSetMode — PIC-directed traffic only flows after them). F-135 answers at
+        PICL 0x20, F-135+ at PICL+ 0x40. Ambiguity falls back to the Plus behaviour."""
+        with self._lock:
+            time.sleep(0.05)             # let the bridge settle post-configure
+            for op in (lambda: self.write2(self.AD_HOST, 0x85),          # HostReset
+                       lambda: self.write_reg(self.AD_HOST, 0x8f, b'\x00')):  # HostSetMode
+                try:
+                    op()
+                except Exception:            # noqa: BLE001 — the open handshake is best-effort here
+                    pass
+            plus = None                  # None = inconclusive; True/False = decided
+            for attempt in range(3):     # early polls can drop right after open
+                if self._probe_present(self.AD_PICL_PLUS):               # PICL+ (F-135+)
+                    plus = True
+                    break
+                if self._probe_present(self.AD_PICL):                    # PICL (F-135)
+                    plus = False
+                    break
+            if plus is None:             # unknown: keep Plus defaults (legacy behaviour)
+                self.is_plus = True
+                if verbose:
+                    print("  [model] WARNING: no controller answered presence probes "
+                          "(0x40/0x20) — assuming F135+")
+            else:
+                self.is_plus = plus
+            self.model = 'F135+' if self.is_plus else 'F135'
+            if not self.is_plus:
+                self.AD_PICL_PLUS = self.AD_PICL                         # light/CCD controller
+                self.AD_SUB = self.AD_PICM                               # motor controller
+            if verbose:
+                print("  [model] detected %s (light=0x%02x motor=0x%02x)"
+                      % (self.model, self.AD_PICL_PLUS, self.AD_SUB))
+        return self.model
 
     def close(self):
         if self.handle is not None:
@@ -310,7 +376,8 @@ def _selftest():
     no motor, no lamp. Confirms libpakon can talk to the loaded scanner."""
     with PakonDevice() as dev:
         d = dev.handle.getDevice()
-        print(f"opened {VID:04x}:{PID_LOADED:04x} bus{d.getBusNumber()} addr{d.getDeviceAddress()}")
+        print(f"opened {VID:04x}:{PID_LOADED:04x} bus{d.getBusNumber()} addr{d.getDeviceAddress()} "
+              f"model={dev.model} (light=0x{dev.AD_PICL_PLUS:02x} motor=0x{dev.AD_SUB:02x})")
         print("-- POLL (status) --")
         for name, addr in (('AD_HOST', dev.AD_HOST), ('AD_PICL_PLUS', dev.AD_PICL_PLUS),
                            ('AD_SUB', dev.AD_SUB)):

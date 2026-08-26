@@ -102,6 +102,12 @@ def decode(path, width, channels, order, out_prefix, preview_step, two_tap=False
         planes = [rgb_block[:, c::3].astype(np.float32) for c in range(3)]          # R,G,B each (nl, 2000)
         ir_plane = lines[:, 6000:8000].astype(np.float32)                            # IR (nl, 2000)
     else:
+        if period and 3000 <= period <= 9000 and period != width * channels:
+            # trust the stream: the CCD window width follows the scan config (an F-135
+            # at idx5=2043 emits 5910-sample = 1970px lines, not 6000)
+            print("  line period %d != width*channels (%d) — using %d px x %d"
+                  % (period, width * channels, period // channels, channels))
+            width = period // channels
         P = width * channels
         phase, on_ph, total = find_line_phase(raw, P)
         if phase is None:
@@ -117,6 +123,7 @@ def decode(path, width, channels, order, out_prefix, preview_step, two_tap=False
                   file=sys.stderr)
             return 1
         lines = raw[:nl * P].reshape(nl, P)
+        lines = lines[:, :width * channels]            # drop pad samples (e.g. 7880 = 2626x3 + 2)
         planes = [lines[:, c::channels].astype(np.float32) for c in range(channels)]   # each (nl, width)
     idx = {'R': 0, 'G': 1, 'B': 2, 'I': 3}
 

@@ -4,7 +4,7 @@
 > image data out of it — firmware load, transport/scan, and a working negative→positive pipeline.
 > That works end to end. The UI is far from complete and is not representative of a finished product.
 
-A local app for the **Kodak/Pakon F135+** film scanner on Linux: a userspace USB driver (no kernel
+A local app for the **Kodak/Pakon F135/F135+** film scanner on Linux: a userspace USB driver (no kernel
 module), the scan/transport control, and a C‑41 negative→positive colour pipeline with live grading
 and IR dust/scratch removal (ICE). psix runs as a **local web app** — it starts a server on your
 machine and opens it in your browser. Nothing leaves your computer.
@@ -45,7 +45,7 @@ Then replug the scanner. (Without this you'd have to run as root.)
 
 ## Scanner firmware (you supply it — Kodak property, not bundled)
 
-The F135+ boots with no application firmware; psix uploads it over USB. You need **one** file — the
+The F135/F135+ boots with no application firmware; psix uploads it over USB. You need **one** file — the
 application image for your scanner's hardware revision:
 
 - `pakon5.hex`, `pakon7.hex`, or `pakon8.hex`  (psix reads the revision and picks the right one)

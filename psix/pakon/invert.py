@@ -124,10 +124,19 @@ def _flat_whites(flatref_path, sample_planes):
     whites = [z['white'][c].astype(np.float32) for c in range(3)]
     if max(float(w.max()) for w in whites) > 64000:                 # clipped (IR scan) -> auto white
         return compute_flatfield_auto(sample_planes)[0], _flat_dark(sample_planes)
+    if whites[0].shape != sample_planes[0][0].shape:                # sidecar from another geometry
+        print("  flat-field: sidecar width %d != stream %d — ignoring (auto)"
+              % (whites[0].shape[0], sample_planes[0][0].shape[0]))
+        return compute_flatfield_auto(sample_planes)[0], _flat_dark(sample_planes)
     if 'exp_open' in z and 'exp_film' in z:
         r = z['exp_film'].astype(np.float32) / np.maximum(z['exp_open'].astype(np.float32), 1.0)
         whites = [whites[c] * r[c] for c in range(3)]
-    darks = [z['dark'][c].astype(np.float32) for c in range(3)] if 'dark' in z else _flat_dark(sample_planes)
+    # dark may be from the calibration-pass geometry (different width than transport) —
+    # fall back to a self-derived dark rather than rejecting the whole sidecar
+    if 'dark' in z and z['dark'][0].shape == sample_planes[0][0].shape:
+        darks = [z['dark'][c].astype(np.float32) for c in range(3)]
+    else:
+        darks = _flat_dark(sample_planes)
     return whites, darks
 
 
@@ -149,9 +158,20 @@ def detect_frames_oem(green_mean, green_std, detail, pitch_override=None):
     if len(fi) < 50:
         return [(0, n)], 0
     fa, fb = int(fi[0]), int(fi[-1])
-    white = float(np.percentile(gm[fa:fb], 99))               # DetectWhite_G analogue = clear-rebate level
+    # rebate ("white") level from the MIDDLE of the span: the open-gate leader/tail rows
+    # (clipped at 65534) sit at the extremes and would drag p99 to the clip level, making
+    # the real rebates fail the gap band (measured on an F-135 roll: rebates ~30k, leader 65k).
+    lo = fa + (fb - fa) * 20 // 100
+    hi = fa + (fb - fa) * 80 // 100
+    white = float(np.percentile(gm[lo:hi], 99)) if hi > lo else float(np.percentile(gm[fa:fb], 99))
     umed = float(np.median(gs[fa:fb]))
-    gapline = (gm >= 0.85 * white) & (gm <= 1.25 * white) & (gs < 0.85 * umed)  # clear band + uniform (gap)
+    # uniformity as COEFFICIENT OF VARIATION (std/level): absolute std scales with
+    # brightness, so a dark film row always "beats" a bright rebate row and the gap
+    # band never fires on a low-light scan (measured on an F-135: rebate CV 0.12 vs
+    # film 0.23 — clear film IS the more uniform surface, relatively).
+    cv = gs / np.maximum(gm, 1.0)
+    cmed = float(np.median(cv[fa:fb]))
+    gapline = (gm >= 0.85 * white) & (gm <= 1.25 * white) & (cv < 0.85 * cmed)  # clear band + uniform (gap)
     gapline[:fa] = False; gapline[fb + 1:] = False
     # gap RUNS as (centre, conf, gstart, gend) — gstart/gend are the rebate edges = the frame's image edges
     runs = []
@@ -320,14 +340,22 @@ def write_raw_negative(rgb, out_prefix, idx, meta, ir_plane=None):
 
 
 def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, ir_thresh=0.04, ir_offset=0,
-                raw_neg=False, neg_only=False, skip_blank=False, ir_kernel=41, ir_min_size=3):
+                raw_neg=False, neg_only=False, skip_blank=False, ir_kernel=41, ir_min_size=3,
+                ir=None):
     nbytes = os.path.getsize(binpath)
     head = np.fromfile(binpath, dtype='<u2', count=8000 * 3000)
     mk = np.flatnonzero(head & 1); d = np.diff(mk); d = d[(d > 1000) & (d < 9000)]
     P = 6000
     if len(d):
-        m = int(np.bincount(d).argmax()); P = 8000 if abs(m - 8000) < abs(m - 6000) else 6000
-    ir_mode = (P == 8000)                                  # 4-channel: RGB(6000 interleaved) + IR(2000)
+        m = int(np.bincount(d).argmax())
+        if 3000 <= m <= 9000:
+            P = m          # the stream's own line period (F-135 @ idx5=2043: 5910 = 1970px x 3)
+    # ir: None = infer from the line period (P==8000 -> IR, the Plus layout). Callers
+    # that know the scan mode pass it explicitly (the F-135 IR line is 7880 samples).
+    ir_mode = (P == 8000) if ir is None else bool(ir)
+    # IR line layout: [RGB visible][IR block]. Plus: 6000+2000 (8000); F-135: 5910+~1968 (7880).
+    IR_RGB = 6000 if P == 8000 else (5910 if P == 7880 else P)
+    W = (IR_RGB if ir_mode else P) // 3                   # visible width in px
     phase, on_ph, total = find_line_phase(head[:P * 3000], P); phase = phase or 0; del head
     nlines = (nbytes // 2 - phase) // P
     white_ir = None
@@ -341,14 +369,42 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
     bright = np.empty(nlines, np.float32); detail = np.empty(nlines, np.float32); unif = np.empty(nlines, np.float32)
     for a in range(0, nlines, 2000):
         b = min(a + 2000, nlines)
-        g = _read_lines(binpath, phase, a, b, P)[:, :6000][:, 1::3].astype(np.float32)   # green of RGB block
+        rgb_vis = IR_RGB if ir_mode else W * 3
+        g = _read_lines(binpath, phase, a, b, P)[:, :rgb_vis][:, 1::3].astype(np.float32)   # green of RGB block
         bright[a:b] = g.mean(1); detail[a:b] = np.abs(np.diff(g, axis=1)).mean(1); unif[a:b] = g.std(1)
         del g
 
     frames, pitch = detect_frames_oem(bright, unif, detail, pitch_override)
+    # transport-axis rescale for isotropic output: a full 35mm frame is 36mm ALONG the
+    # strip, so the median detected frame length directly gives lines/mm (no assumption
+    # about rebate width — the gap varies by camera). Across the strip the window is the
+    # 24mm image height. Plus: ~3000 lines/36mm vs ~83 px/mm -> factor 1.0 (no-op);
+    # F-135 base16: ~4126 lines/36mm = 114.6 lines/mm vs 82.1 px/mm -> x0.716.
+    iso_f = None
+    if frames and len(frames) >= 2:
+        # (a single strip-spanning "frame" gives a meaningless length — skip)
+        # Across px/mm: the window reads the FULL 24mm frame height in every mode
+        # (base16 = 2000px across per pakon-reference image-stream.md; scans are never
+        # cropped below 24mm). Transport lines/mm comes from the measured frame pitch
+        # (a full frame is 36mm): at the OEM base16 motor rate the transport samples
+        # ~114.6 lines/mm — 1.376x denser than across. The OEM oversamples the same way
+        # and resamples to its 2000x3000 output; the isotropic rescale below reproduces
+        # exactly that downsampling (output 2000x~3003 = TLX geometry).
+        px_per_mm = W / 24.0
+        lens = sorted(b - a for a, b in frames)
+        med = lens[len(lens) // 2]
+        good = [L for L in lens if 0.7 * med <= L <= 1.4 * med]      # drop partials/outliers
+        if good and med > 300:
+            lines_per_mm = (sum(good) / len(good)) / 36.0
+            f_ = px_per_mm / lines_per_mm
+            if 0.2 < f_ < 2.0 and abs(f_ - 1.0) > 0.02:
+                iso_f = f_
+                print("  isotropic scale: frames %d lines / 36mm = %.1f lines/mm vs %.1f px/mm"
+                      " across -> transport x%.3f" % (sum(good) / len(good), lines_per_mm, px_per_mm, iso_f))
     if not frames:
         print("no film content found"); return 1
-    fmt, aspect, plausible, why = classify_format(pitch, frames, nlines)
+    fmt, aspect, plausible, why = classify_format(
+        pitch, frames, nlines, line_px=(P // 3) / iso_f if iso_f else W)
     print("pitch=%d px (%.2f:1); %d frames; format=%s" % (pitch, aspect, len(frames), fmt))
     if not plausible:
         print("  !! DEGENERATE DETECTION: %s" % why)
@@ -368,7 +424,7 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
 
     cs, ce = frames[len(frames) // 2]; cw = min(10000, ce - cs)
     seg = _read_lines(binpath, phase, cs, cs + cw, P).astype(np.float32)
-    spl = [seg[:, :6000][:, c::3] for c in range(3)]
+    spl = [seg[:, :W*3][:, c::3] for c in range(3)]
     off = [0, _best_offset(spl[1], spl[0]), _best_offset(spl[2], spl[0])]
     whites, darks = _flat_whites(flatref, spl)
     order = sorted(range(3), key=lambda c: off[c])
@@ -383,11 +439,11 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
         flag = ("  [BLANK]" if blank_flags[i] else "") + ("  [PARTIAL]" if partial_flags[i] else "")
         a2 = max(0, a - halo); b2 = min(nlines, b + halo)
         seg = _read_lines(binpath, phase, a2, b2, P).astype(np.float32)
-        planes = apply_flatfield([seg[:, :6000][:, c::3] for c in range(3)], whites, darks, balance=False)
+        planes = apply_flatfield([seg[:, :W*3][:, c::3] for c in range(3)], whites, darks, balance=False)
         planes = [np.roll(planes[c], off[c], axis=0) for c in range(3)]
         dusty_planes = None
         if ir_mode and white_ir is not None:               # IR-ICE: detect defects, inpaint RGB (pre-orient)
-            ir = np.roll(seg[:, 6000:8000], ir_offset, axis=0)
+            ir = np.roll(seg[:, IR_RGB:P], ir_offset, axis=0)
             mask = ir_defect_mask(ir, white_ir, ir_thresh, ir_kernel, ir_min_size)
             ndef += int(mask.sum())
             if mask.any():
@@ -395,15 +451,33 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
                 planes = inpaint_rgb(planes, mask)
         cr = slice(a - a2, a - a2 + (b - a))
 
-        def _orient(pl):                                    # planes -> oriented RGB neg (channel reorder + cw)
+        def _orient(pl):                                    # planes -> oriented RGB neg (channel reorder + rot)
+            # rot90 k=3 for BOTH generations (validated against PSI output 2026-08-25;
+            # the earlier F-135 "wrong orientation" was the resize axis-swap bug, not this)
             return np.ascontiguousarray(np.rot90(
                 np.dstack([pl[order[2]][cr], pl[order[1]][cr], pl[order[0]][cr]]), 3)).astype(np.float32)
         rgb = _orient(planes)
+        # ISOTROPIC RESCALE: the two axes sample the film at different px/mm unless the
+        # transport rate happens to match the CCD (true on a Plus, NOT on an F-135, whose
+        # base16 runs ~118 lines/mm vs 82 px/mm across -> frames 1.44x too tall). The
+        # scale comes from the film stock itself (35.00mm width, 4.234mm perforation
+        # pitch — both standards, no scanner-specific gap assumption); falls back to the
+        # measured-pitch/38mm estimate when the perforations aren't detectable.
+        try:
+            import cv2
+            f = iso_f
+            if f and 0.2 < f < 2.0 and abs(f - 1.0) > 0.02:
+                # transport axis = cols on the oriented neg; cv2 dsize is (width, height)
+                nh = max(1, int(round(rgb.shape[1] * f)))
+                rgb = np.ascontiguousarray(cv2.resize(rgb, (nh, rgb.shape[0]), interpolation=cv2.INTER_AREA))
+                print("  frame %2d: isotropic rescale x%.3f (transport -> %d px)" % (i, f, rgb.shape[1]))
+        except Exception:                                  # noqa: BLE001 — never fail the neg for a resize
+            pass
         if raw_neg or neg_only:                            # §3 archival 16-bit raw-negative per frame
             ir_arch = None
             if ir_mode:                                    # oriented IR plane (independent of ICE)
                 ir_arch = np.ascontiguousarray(np.rot90(
-                    np.roll(seg[:, 6000:8000], ir_offset, axis=0)[cr], 3)).astype(np.float32)
+                    np.roll(seg[:, IR_RGB:P], ir_offset, axis=0)[cr], 3)).astype(np.float32)
             meta = {'kind': 'raw-negative', 'space': 'linear', 'mask': 'orange-intact',
                     'flatfield': 'gentle-prnu', 'invert': False, 'tone': False,
                     'frame': i, 'lines': [int(a), int(b)], 'pitch_px': int(pitch),

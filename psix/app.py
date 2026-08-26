@@ -20,7 +20,7 @@ from flask import (
 )
 
 from .config import Config, user_data_dir
-from .driver import ScannerDriver
+from .driver import ScannerDriver, ScannerError
 from .processing import (
     DEFAULT_GRADE, ICE_DEFAULTS as DEFAULT_ICE, export_frame, grade_preview_jpeg,
     grade_with_defaults, ice_preview_jpeg, ice_view_jpeg,
@@ -234,6 +234,28 @@ def create_app(data_dir=None):
         payload = request.get_json(silent=True) or request.form.to_dict()
         roll = rolls.create_roll(payload.get("name"))
         return jsonify({"roll": roll}), 201
+
+    @app.route("/api/scanner/film", methods=["POST"])
+    def api_scanner_film():
+        """Motor-only film transport: eject (forward), rewind (reverse) or a timed
+        move. No lamp, no scan. Returns 409 if a scan or another device op is busy."""
+        payload = request.get_json(silent=True) or {}
+        action = payload.get("action", "eject")
+        seconds = min(120.0, max(0.5, float(payload.get("seconds", 15))))
+        try:
+            if action == "eject":
+                ok = driver.move_film(seconds=seconds, reverse=False)
+            elif action == "rewind":
+                ok = driver.move_film(seconds=seconds, reverse=True)
+            elif action == "move":
+                ok = driver.move_film(seconds=seconds,
+                                      reverse=_coerce_bool(payload.get("reverse", False)))
+            else:
+                return jsonify({"error": "unknown action"}), 400
+        except ScannerError as exc:
+            msg = str(exc)
+            return jsonify({"error": msg}), (409 if "busy" in msg.lower() else 503)
+        return jsonify({"action": action, "seconds": seconds, "moved": bool(ok)})
 
     @app.route("/api/rolls/<int:roll_id>/scan", methods=["POST"])
     def api_roll_scan(roll_id):

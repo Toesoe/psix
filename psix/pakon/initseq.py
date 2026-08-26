@@ -15,7 +15,7 @@ GENERATED from documented protocol values, so there is no captured/per-unit payl
 Wire grammar (libpakon): packet = [Type, PktLen, Addr, payload], PktLen = 1 + len(payload).
   Type1 READ   payload=[reg,count]      Type2 WRITE  payload=[count,reg,*vals]
   Type3 POLL   payload=[]               Type4 WRITE2 payload=[0x00,val]
-Subsystem addrs: 0x10 HOST, 0x40 PICL+, 0x44 sub44.
+Subsystem addrs: 0x10 HOST; light/motor controllers 0x40/0x44 (F-135+) or 0x20/0x24 (F-135).
 
 EEPROM I/O: vendor control transfers, magic wIndex 0x1234, 0x20-byte chunks:
   A4 (req 0xa4, OUT, wValue 0xa5) setup, then A9 (req 0xa9, IN, wValue=byte addr) read.
@@ -129,68 +129,78 @@ def eeprom_steps(record_lens):
     return out
 
 
-def build_init_steps(record_lens=(0x18e, 0x24)):
-    """The full reconstructed InitializeScanner sequence (RE-derived). `record_lens` are the two
-    EEPROM record sizes; read live from headers at runtime, defaulted to the F135 structural sizes."""
+def build_init_steps(light=PICL_PLUS, motor=SUB44, tec=True, record_lens=(0x18e, 0x24), geo=None):
+    """The full reconstructed InitializeScanner sequence (RE-derived). `light`/`motor` are the
+    light/CCD and motor controller bus addresses (PICL+/sub44 = 0x40/0x44 on an F-135+,
+    PICL/PICM = 0x20/0x24 on an F-135 — same commands, different addresses). `tec` gates the
+    TEC setpoint writes (the F-135 has no CCD cooler). `geo` overrides the per-unit geometry
+    words written to the motor controller (idx4 window start / idx5 end / idx6 integration) —
+    psix passes the unit's own EEPROM values on an F-135. `record_lens` are the two EEPROM
+    record sizes; read live from headers at runtime, defaulted to the F135 structural sizes."""
+    sub82 = list(SUB_CFG_82)
+    if geo:
+        sub82 = [(idx, geo.get({4: 'offset', 5: 'end', 6: 'integration'}.get(idx), v))
+                 for idx, v in sub82]
     s = []
     # PHASE 1 — HOST bring-up (open: const)
     s += [bulk(p_write2(HOST, 0x85), 'bringup', 'host init/reset cmd 0x85'),
           bulk(p_write(HOST, 0x8f, [0x00]), 'bringup', 'host interface reg0x8f=0'),
-          bulk(p_write2(SUB44, 0x00), 'bringup', 'sub44 select [0000]')]
+          bulk(p_write2(motor, 0x00), 'bringup', 'motor select [0000]')]
     # PHASE 2 — EEPROM read (device-provided: LED calibration)
     s += eeprom_steps(record_lens)
     # PHASE 3 — presence + identify (const cmds; serial is device-provided)
     s += [bulk(p_read(HOST, 0x02, 3), 'identify', 'HOST presence (expect bit7 0x88)', live=True),
-          bulk(p_write2(SUB44, 0x00), 'identify', 'sub44 select'),
-          bulk(p_write(SUB44, 0x97, [0x01]), 'identify', 'sub44 reg0x97=1'),
-          bulk(p_poll(SUB44), 'identify', 'poll sub44'),
-          bulk(p_write(PICL_PLUS, 0x03, [0x01]), 'identify', 'PICL+ reg0x03=1 (latch serial)'),
-          bulk(p_poll(PICL_PLUS), 'identify', 'poll PICL+'),
-          bulk(p_read(PICL_PLUS, 0x0c, 7), 'identify', 'read PICL+ serial', live=True),
-          bulk(p_write(SUB44, 0x03, [0x01]), 'identify', 'sub44 reg0x03=1'),
-          bulk(p_poll(SUB44), 'identify', 'poll sub44'),
-          bulk(p_read(SUB44, 0x0c, 7), 'identify', 'read sub44 serial', live=True)]
+          bulk(p_write2(motor, 0x00), 'identify', 'motor select'),
+          bulk(p_write(motor, 0x97, [0x01]), 'identify', 'motor reg0x97=1'),
+          bulk(p_poll(motor), 'identify', 'poll motor'),
+          bulk(p_write(light, 0x03, [0x01]), 'identify', 'light reg0x03=1 (latch serial)'),
+          bulk(p_poll(light), 'identify', 'poll light'),
+          bulk(p_read(light, 0x0c, 7), 'identify', 'read light serial', live=True),
+          bulk(p_write(motor, 0x03, [0x01]), 'identify', 'motor reg0x03=1'),
+          bulk(p_poll(motor), 'identify', 'poll motor'),
+          bulk(p_read(motor, 0x0c, 7), 'identify', 'read motor serial', live=True)]
     # PHASE 4 — arm pulse (const)
     s += [bulk(p_write(HOST, 0x84, [0x02]), 'arm', 'arm pulse HOST reg0x84=2'),
-          bulk(p_write2(PICL_PLUS, 0x8a), 'arm', 'arm pulse PICL+ [008a]'),
-          bulk(p_poll(PICL_PLUS), 'arm', 'poll PICL+')]
-    # PHASE 5 — temperature-control / TEC setpoints (model-generic OEM defaults)
+          bulk(p_write2(light, 0x8a), 'arm', 'arm pulse light [008a]'),
+          bulk(p_poll(light), 'arm', 'poll light')]
+    # PHASE 5 — temperature-control / TEC setpoints (model-generic OEM defaults; TEC = Plus only)
     for reg, payload in TEMP_SETPOINTS.items():
-        s.append(bulk(p_write(PICL_PLUS, reg, payload), 'tempcfg', 'temp setpoint reg0x%02x' % reg))
-        s.append(bulk(p_poll(PICL_PLUS), 'tempcfg', 'poll'))
-    for reg, val in TEC:
-        s.append(bulk(p_write(PICL_PLUS, reg, [val]), 'tempcfg', 'TEC reg0x%02x=%d' % (reg, val)))
-        s.append(bulk(p_poll(PICL_PLUS), 'tempcfg', 'poll'))
+        s.append(bulk(p_write(light, reg, payload), 'tempcfg', 'temp setpoint reg0x%02x' % reg))
+        s.append(bulk(p_poll(light), 'tempcfg', 'poll'))
+    if tec:
+        for reg, val in TEC:
+            s.append(bulk(p_write(light, reg, [val]), 'tempcfg', 'TEC reg0x%02x=%d' % (reg, val)))
+            s.append(bulk(p_poll(light), 'tempcfg', 'poll'))
     # PHASE 6 — InitCfgCore (const)
     for reg, payload in PICL_CFG:
-        s.append(bulk(p_write(PICL_PLUS, reg, payload), 'initcfg', 'PICL+ reg0x%02x' % reg))
-        s.append(bulk(p_poll(PICL_PLUS), 'initcfg', 'poll'))
-    for idx, val in SUB_CFG_82:
-        s.append(bulk(p_write(SUB44, 0x82, [idx, val & 0xff, (val >> 8) & 0xff]), 'initcfg',
-                      'sub44 reg0x82 idx%d=0x%x' % (idx, val)))
-        s.append(bulk(p_poll(SUB44), 'initcfg', 'poll'))
+        s.append(bulk(p_write(light, reg, payload), 'initcfg', 'light reg0x%02x' % reg))
+        s.append(bulk(p_poll(light), 'initcfg', 'poll'))
+    for idx, val in sub82:
+        s.append(bulk(p_write(motor, 0x82, [idx, val & 0xff, (val >> 8) & 0xff]), 'initcfg',
+                      'motor reg0x82 idx%d=0x%x' % (idx, val)))
+        s.append(bulk(p_poll(motor), 'initcfg', 'poll'))
     for idx, val in SUB_CFG_84:
-        s.append(bulk(p_write(SUB44, 0x84, [idx, val & 0xff, (val >> 8) & 0xff]), 'initcfg',
-                      'sub44 reg0x84 idx%d=0x%x' % (idx, val)))
-        s.append(bulk(p_poll(SUB44), 'initcfg', 'poll'))
-    s += [bulk(p_write2(SUB44, 0xa2), 'initcfg', 'sub44 motor idle [00a2]'),
-          bulk(p_poll(SUB44), 'initcfg', 'poll')]
+        s.append(bulk(p_write(motor, 0x84, [idx, val & 0xff, (val >> 8) & 0xff]), 'initcfg',
+                      'motor reg0x84 idx%d=0x%x' % (idx, val)))
+        s.append(bulk(p_poll(motor), 'initcfg', 'poll'))
+    s += [bulk(p_write2(motor, 0xa2), 'initcfg', 'motor idle [00a2]'),
+          bulk(p_poll(motor), 'initcfg', 'poll')]
     # PHASE 7 — reactive prime (device-provided sensor reads; service-ack)
     s += [bulk(p_poll(HOST), 'reactive', 'poll HOST'),
-          bulk(p_read(PICL_PLUS, 0x01, 2), 'reactive', 'sensor reg0x01', live=True),
-          bulk(p_write(PICL_PLUS, 0x06, [0x00, 0x02]), 'reactive', 'service-ack reg0x06=0002'),
-          bulk(p_poll(PICL_PLUS), 'reactive', 'poll'),
-          bulk(p_read(PICL_PLUS, 0x1e, 0x90), 'reactive', 'DX-code sensor block reg0x1e', live=True),
-          bulk(p_read(PICL_PLUS, 0x01, 0x83), 'reactive', 'reg0x01 block', live=True),
-          bulk(p_read(PICL_PLUS, 0x02, 0x84), 'reactive', 'reg0x02 block', live=True),
-          bulk(p_read(PICL_PLUS, 0x04, 0x88), 'reactive', 'reg0x04 block', live=True),
+          bulk(p_read(light, 0x01, 2), 'reactive', 'sensor reg0x01', live=True),
+          bulk(p_write(light, 0x06, [0x00, 0x02]), 'reactive', 'service-ack reg0x06=0002'),
+          bulk(p_poll(light), 'reactive', 'poll'),
+          bulk(p_read(light, 0x1e, 0x90), 'reactive', 'DX-code sensor block reg0x1e', live=True),
+          bulk(p_read(light, 0x01, 0x83), 'reactive', 'reg0x01 block', live=True),
+          bulk(p_read(light, 0x02, 0x84), 'reactive', 'reg0x02 block', live=True),
+          bulk(p_read(light, 0x04, 0x88), 'reactive', 'reg0x04 block', live=True),
           bulk(p_poll(HOST), 'reactive', 'poll HOST'),
-          bulk(p_read(SUB44, 0x01, 2), 'reactive', 'sub44 reg0x01', live=True),
+          bulk(p_read(motor, 0x01, 2), 'reactive', 'motor reg0x01', live=True),
           # the 2 computed exposure writes (idx9) — scan-time defaults, harmless at init
-          bulk(p_write(SUB44, 0x82, [0x09, 0x14, 0x00]), 'reactive', 'sub44 reg0x82 idx9=0x14'),
-          bulk(p_poll(SUB44), 'reactive', 'poll'),
-          bulk(p_write(SUB44, 0x82, [0x09, 0x17, 0x00]), 'reactive', 'sub44 reg0x82 idx9=0x17'),
-          bulk(p_poll(SUB44), 'reactive', 'poll')]
+          bulk(p_write(motor, 0x82, [0x09, 0x14, 0x00]), 'reactive', 'motor reg0x82 idx9=0x14'),
+          bulk(p_poll(motor), 'reactive', 'poll'),
+          bulk(p_write(motor, 0x82, [0x09, 0x17, 0x00]), 'reactive', 'motor reg0x82 idx9=0x17'),
+          bulk(p_poll(motor), 'reactive', 'poll')]
     # PHASE 8 — wait-ready heartbeat (poll HOST until bit7 settles)
     for _ in range(22):
         s.append(bulk(p_poll(HOST), 'waitready', 'poll HOST (settle ready)', live=True))
