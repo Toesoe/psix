@@ -204,9 +204,13 @@ def build_current(r, g, b, ir=0):
 # duties <=900, exposure base 982, trigger 3c/310001) do NOT transfer.
 F135_CURRENTS = (2, 3, 3)          # (R, G, B) -> reg0x81 [B,IR,R,0,G] = 3,2,2,3
 F135_CURRENT_IR = 2                # IR current (IR scans)
-F135_EXP = (896, 707, 278)         # (R, G, B) duties — film and open gate (OEM uses ~same)
+F135_EXP = (896, 707, 278)         # (R, G, B) OPEN-GATE duties (white ref; OEM servo-converged)
+F135_FILM_EXP = (1250, 1768, 1440)  # (R, G, B) FILM duties — scan_fullroll.pakscan line 1219
+#   [b=0x05a0 ir=0x0553 r=0x04e2 0 g=0x06e8 base=0x0742]. The OEM servos the open gate at
+#   ~278/895/707 then swaps to these before motor-go — scanning film at the open-gate duties
+#   underexposes B 5.2x (roll23: banded, ghosted negs).
 F135_EXP_BASE = 1858               # reg0x82 base field (Plus: 0x03d6=982)
-F135_IR_DUTY = 1353                # IR duty field (reg0x82 u16[1])
+F135_IR_DUTY = 1363                # IR duty field, film phase (open gate ~1361-1364)
 F135_TRIGGER = b'\x10\x00\x01'     # reg0x91 trigger word (Plus: 3c0001 3ch / 310001 IR)
 F135_MOTOR_RATE = 0x0615           # 1557 — OEM base16 transport rate, 3ch and IR alike
 
@@ -565,13 +569,13 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
            'cmax': (0, 0, 0), 'writing': False, 'total': 0,
            'grab': None, 'grab_need': 0, 'og': None}
     LINE_S = 2000 * 3                                  # samples/line (3ch) — DETECTED live below:
-    # IR-mode line layout: [RGB visible samples][IR block]. Plus: 6000+2000 = 8000;
-    # F-135: 5910+~1968 = 7880 (1970px RGB + IR block).
-    IR_RGB_SAMPLES = 6000 if getattr(dev, 'is_plus', True) else 5910
+    # IR-mode line layout: [visible*3 RGB][trailing 2000-sample IR block] — measured on HW
+    # 2026-08-26 (roll23): interleave phase breaks exactly at P-2000 for BOTH models. The
+    # visible width follows idx5: at idx5=2073 both emit 8000-sample lines (6000+2000); an
+    # idx5=2043 variant gives 5910+1970=7880. Always slice the IR block as the LAST 2000.
     img['det'] = bytearray()                           # stream sample for line-period detection
-    # the CCD window width follows the scan config (idx5): 2000 px on a Plus, 1970 px on an
-    # F-135 (idx5=2043) -> 5910-sample lines. The dark-pass block measures the marker spacing
-    # from img['det'] and corrects LINE_S before any grab/white-ref/servo slicing depends on it.
+    # The dark-pass block measures the marker spacing from img['det'] and corrects LINE_S
+    # before any grab/white-ref/servo slicing depends on it.
     def _detect_line_period():
         """Dominant marker spacing in the detection sample -> LINE_S. The calibration
         pass (trigger#1) runs a different, full-window format than transport, so the
@@ -675,7 +679,7 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                     and addr == dev.AD_PICL_PLUS and pkt[4] == 0x80 and pkt[5] != 0x00):
                 dark_done[0] = True
                 _detect_line_period()
-                Pd = LINE_S                                # detected line period (8000/7880 IR, 5910/6000 3ch)
+                Pd = LINE_S                                # detected line period (8000 IR, 6000 3ch @ idx5=2073)
                 img['grab'] = bytearray(); img['grab_need'] = DARK_LINES * Pd * 2
                 dend = time.monotonic() + 1.5
                 while len(img['grab']) < img['grab_need'] and time.monotonic() < dend:
@@ -691,10 +695,13 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                     mm = da[ph: ph + ((len(da) - ph) // Pd) * Pd]
                     if len(mm) >= Pd:
                         ln = mm.reshape(-1, Pd).astype(np.float32)
-                        rgb_vis = IR_RGB_SAMPLES if ir else (Pd - (Pd % 3))
+                        # floor to a multiple of 3 so the three channel slices stack — the
+                        # calibration pass runs 8268-sample lines (6268 % 3 != 0 -> np.stack
+                        # "arrays must be the same shape" crash, roll23-rescan 2026-08-26)
+                        rgb_vis = ((Pd - 2000) // 3) * 3 if ir else (Pd - (Pd % 3))
                         dark_ref[0] = np.stack([ln[:, :rgb_vis][:, c::3].mean(axis=0) for c in range(3)])
                         if ir:
-                            dark_ir_ref[0] = ln[:, IR_RGB_SAMPLES:Pd].mean(axis=0)                              # (2000,)
+                            dark_ir_ref[0] = ln[:, Pd - 2000:Pd].mean(axis=0)                                   # (2000,)
                         print("  [%5.1fs] DARK ref: %d lamp-off %s lines, per-ch mean R/G/B=%.0f/%.0f/%.0f%s"
                               % (time.monotonic() - t0, ln.shape[0], "4-ch" if ir else "3-ch",
                                  dark_ref[0][0].mean(), dark_ref[0][1].mean(), dark_ref[0][2].mean(),
@@ -960,8 +967,9 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
             # roll5: open-gate servo reached 0xf000 but the neg stayed ~half-level/29% crushed, identical to
             # roll4 — because IR mode integrates LESS light PER LINE; the real exposure lever is the IR
             # motor/line-rate, NOT reg0x82 duty). So keep the OEM-faithful values here.
-            IRP = LINE_S                                    # detected line samples (8000 Plus / 7880 F-135)
-            IR_RGB_SAMPLES = 6000 if is_plus else 5910      # visible samples per line
+            _detect_line_period()                          # re-measure on TRANSPORT lines (the F-135 calib pass
+            IRP = LINE_S                                   # runs 8268-sample lines — aligning 8000-sample
+            IR_RGB_SAMPLES = (IRP - 2000) // 3 * 3         # transport lines with 8268 gives garbage white refs)
             IR_DUTY, EXP_BASE, OPEN_TGT = 0x01df, 0x0257, 0xd000
             FILM_RGB = (0x0216, 0x0255, 0x01a5)             # OEM film duty (r,g,b); RGB well-exposed on film
             exp = [0x017f, 0x00ef, 0x0053]                  # start at the OEM converged open-gate duty (r,g,b)
@@ -971,11 +979,12 @@ def transport(dev, steps, out_path, seconds, max_bytes, pump, film_thresh=4000, 
                 # OEM's own in-scan servo nudges IR duty by +-1 — effectively fixed.
                 IR_DUTY = F135_IR_DUTY
                 EXP_BASE = F135_EXP_BASE
-                FILM_RGB = tuple(F135_EXP)
-                exp = list(F135_EXP)
+                FILM_RGB = tuple(F135_FILM_EXP)             # scan runs at the OEM FILM duties
+                exp = list(F135_EXP)                        # white ref at the OEM OPEN-GATE duties
                 dev.write_reg(dev.AD_PICL_PLUS, 0x81, build_current(2, 3, 3, ir=F135_CURRENT_IR)); _arm()
-                print("\n  >>> F-135 IR: OEM-capture fixed exposure (currents R/G/B/IR=2/3/3/2, "
-                      "duty R/G/B=%d/%d/%d, IR %d, base %d) — no servo." % (*F135_EXP, F135_IR_DUTY, F135_EXP_BASE))
+                print("\n  >>> F-135 IR: OEM-capture exposure (currents R/G/B/IR=2/3/3/2, base %d): "
+                      "open gate %d/%d/%d (white ref), film %d/%d/%d (scan), IR duty %d — no servo."
+                      % (F135_EXP_BASE, *F135_EXP, *F135_FILM_EXP, F135_IR_DUTY))
                 servo_ok = True
             else:
                 print("\n  >>> IR scan: servoing RGB duty on the open gate (IR duty 0x%03x HELD, target 0x%04x)..."

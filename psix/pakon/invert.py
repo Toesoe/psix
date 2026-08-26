@@ -140,6 +140,30 @@ def _flat_whites(flatref_path, sample_planes):
     return whites, darks
 
 
+def _rebate_refs(binpath, phase, frames, P, vis_samples):
+    """Per-column clear-film references measured on the REBATE gaps between frames (content-free,
+    unlike percentile-over-the-strip estimates which are biased by bright scene areas). Returns
+    (whites [3 x W], white_ir [W_ir]) or (None, None) when the strip has no usable gaps.
+    Only the per-column SHAPE matters: apply_flatfield normalises each channel to its own median."""
+    spans = []
+    for (a1, b1), (a2, b2) in zip(frames, frames[1:]):
+        lo, hi = b1 + 20, a2 - 20
+        if hi - lo > 60:
+            spans.append((lo, min(hi, lo + 400)))
+    if not spans:
+        return None, None
+    acc = [[], [], []]; acc_ir = []
+    for lo, hi in spans:
+        seg = _read_lines(binpath, phase, lo, hi, P).astype(np.float32)
+        for c in range(3):
+            acc[c].append(seg[:, :vis_samples][:, c::3])
+        if P > vis_samples:                                # IR block = trailing samples
+            acc_ir.append(seg[:, vis_samples:P])
+    whites = [np.percentile(np.vstack(a), 80, axis=0).astype(np.float32) for a in acc]
+    white_ir = np.percentile(np.vstack(acc_ir), 80, axis=0).astype(np.float32) if acc_ir else None
+    return whites, white_ir
+
+
 # ---------- frame detection (clear-rebate gap method on the green channel) ----------
 def detect_frames_oem(green_mean, green_std, detail, pitch_override=None):
     """OEM-style 35mm frame detection on the GREEN channel (no sprockets):
@@ -349,12 +373,13 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
     if len(d):
         m = int(np.bincount(d).argmax())
         if 3000 <= m <= 9000:
-            P = m          # the stream's own line period (F-135 @ idx5=2043: 5910 = 1970px x 3)
-    # ir: None = infer from the line period (P==8000 -> IR, the Plus layout). Callers
-    # that know the scan mode pass it explicitly (the F-135 IR line is 7880 samples).
+            P = m          # the stream's own line period (idx5-dependent: 8000 @ 2073, 5910 @ legacy 2043)
+    # ir: None = infer from the line period (P==8000 -> IR). Callers that know the scan mode
+    # pass it explicitly.
     ir_mode = (P == 8000) if ir is None else bool(ir)
-    # IR line layout: [RGB visible][IR block]. Plus: 6000+2000 (8000); F-135: 5910+~1968 (7880).
-    IR_RGB = 6000 if P == 8000 else (5910 if P == 7880 else P)
+    # IR line layout: [visible*3 RGB][trailing 2000-sample IR block] (HW-measured 2026-08-26,
+    # roll23: phase breaks exactly at P-2000). 7880 = legacy idx5=2043 captures (5910+1970).
+    IR_RGB = 5910 if P == 7880 else (P - 2000)
     W = (IR_RGB if ir_mode else P) // 3                   # visible width in px
     phase, on_ph, total = find_line_phase(head[:P * 3000], P); phase = phase or 0; del head
     nlines = (nbytes // 2 - phase) // P
@@ -363,6 +388,14 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
         z = np.load(flatref)
         if 'white_ir' in z:
             white_ir = z['white_ir'].astype(np.float32)
+            if white_ir.shape[0] != P - IR_RGB:            # sidecar sliced with a stale layout
+                print("  flat-field: white_ir width %d != stream %d — ignoring (auto)"
+                      % (white_ir.shape[0], P - IR_RGB))
+                white_ir = None
+    if ir_mode and white_ir is None:
+        white_ir = 'rebate'                             # deferred: derived from the gap rows after detection
+        # (the old per-column percentile over the whole strip was content-biased: columns through
+        #  bright scene areas got inflated whites -> false ICE columns -> banded inpaints)
     print("line=%d (%s), phase=%d, ~%d lines%s" % (P, "RGB+IR" if ir_mode else "RGB", phase, nlines,
           "" if not ir_mode else (" | IR-ICE %s" % ("ON" if white_ir is not None else "no white_ir->OFF"))))
 
@@ -404,7 +437,7 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
     if not frames:
         print("no film content found"); return 1
     fmt, aspect, plausible, why = classify_format(
-        pitch, frames, nlines, line_px=(P // 3) / iso_f if iso_f else W)
+        pitch, frames, nlines, line_px=W / iso_f if iso_f else W)   # post-rescale width
     print("pitch=%d px (%.2f:1); %d frames; format=%s" % (pitch, aspect, len(frames), fmt))
     if not plausible:
         print("  !! DEGENERATE DETECTION: %s" % why)
@@ -427,6 +460,24 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
     spl = [seg[:, :W*3][:, c::3] for c in range(3)]
     off = [0, _best_offset(spl[1], spl[0]), _best_offset(spl[2], spl[0])]
     whites, darks = _flat_whites(flatref, spl)
+    # rebate-derived references: content-free per-column whites. The percentile-over-sample
+    # auto white is scene-biased (columns through bright scene areas get inflated whites ->
+    # ±10% across-axis gain bands). Override the AUTO path only — a valid open-gate sidecar
+    # still wins for RGB; white_ir is only 'rebate' when the sidecar's was invalid.
+    sidecar_ok = False
+    if flatref:
+        z = np.load(flatref)
+        if 'white' in z and z['white'].shape[0] == W and max(float(z['white'].max()), 1) <= 64000:
+            sidecar_ok = True
+    if not sidecar_ok or white_ir == 'rebate':
+        rw, rw_ir = _rebate_refs(binpath, phase, frames, P, W * 3)
+        if not sidecar_ok and rw is not None:
+            whites = rw
+            print("  flat-field: rebate-derived per-column white (%d gap span(s))" % (len(frames) - 1))
+        if white_ir == 'rebate':
+            white_ir = rw_ir
+            if white_ir is not None:
+                print("  flat-field: rebate-derived white_ir (%d cols)" % white_ir.shape[0])
     order = sorted(range(3), key=lambda c: off[c])
     halo = max(abs(o) for o in off) + abs(ir_offset) + 5
     del seg, spl
@@ -490,12 +541,20 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
             np_path = write_raw_negative(rgb, out_prefix, i, meta, ir_arch)
             if dusty_planes is not None:                   # ICE before/after sidecar: the dusty pixels ICE replaced
                 rgb_dusty = _orient(dusty_planes)
-                d = np.any(np.abs(rgb - rgb_dusty) > 0.5, axis=2)
-                ys, xs = np.where(d)
-                if len(ys):
-                    np.savez('%s_f%02d_neg_ice.npz' % (out_prefix, i),
-                             yx=np.stack([ys, xs]).astype(np.int32),
-                             vals=np.clip(rgb_dusty[ys, xs], 0, 65535).round().astype('<u2'))
+                if rgb_dusty.shape != rgb.shape:           # rgb was isotropically rescaled above — match it
+                    try:
+                        import cv2
+                        rgb_dusty = np.ascontiguousarray(cv2.resize(
+                            rgb_dusty, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_AREA))
+                    except Exception:                      # noqa: BLE001 — sidecar only, never fail the neg
+                        rgb_dusty = None
+                if rgb_dusty is not None:
+                    d = np.any(np.abs(rgb - rgb_dusty) > 0.5, axis=2)
+                    ys, xs = np.where(d)
+                    if len(ys):
+                        np.savez('%s_f%02d_neg_ice.npz' % (out_prefix, i),
+                                 yx=np.stack([ys, xs]).astype(np.int32),
+                                 vals=np.clip(rgb_dusty[ys, xs], 0, 65535).round().astype('<u2'))
             print("  frame %2d: lines %6d..%6d -> %dx%d  RAW-NEG %s%s%s"
                   % (i, a, b, rgb.shape[1], rgb.shape[0], np_path,
                      "  (+IR)" if ir_arch is not None else "", flag))

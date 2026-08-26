@@ -241,7 +241,7 @@ def remap_steps(steps, light=PICL_PLUS, motor=SUB44, ir=False):
         if ir and b[0] == 2 and len(b) == 8 and b[4] == 0x82 and b[5] == 0x00:
             v = b[6] | (b[7] << 8)
             if v in (0x60, 0x61):              # IR mode: enable-mask bit 0x100 adds the
-                nv = v | 0x100                 # IR block to the line ([RGB 5910][IR ~1968])
+                nv = v | 0x100                 # trailing IR block ([RGB 6000][IR 2000])
                 b[6], b[7] = nv & 0xff, (nv >> 8) & 0xff
         if b[0] == 2 and len(b) >= 8 and b[4] == 0x91:
             b[5:8] = F135_TRIGGER                      # OEM F-135 trigger word

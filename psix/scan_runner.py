@@ -274,6 +274,8 @@ class ScanRunner:
                             message="captured %d bytes" % nbytes, error=None)
             self._publish("done", {"roll_id": roll["id"], **record})
         except Exception as exc:                      # noqa: BLE001 — report to the UI
+            import traceback
+            traceback.print_exc()                     # full stack in the server log (UI gets the message only)
             self._set_state(busy=False, phase="failed", message="failed", error=str(exc))
             self._publish("error", {"roll_id": roll["id"], "error": str(exc)})
 
