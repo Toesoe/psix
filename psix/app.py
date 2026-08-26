@@ -9,6 +9,7 @@ also runs as a plain local server for development.
 """
 
 import json
+import os
 import queue
 import shutil
 import time
@@ -182,6 +183,22 @@ def create_app(data_dir=None):
     def api_status():
         return jsonify(scanner.status())
 
+    @app.route("/api/device")
+    def api_device():
+        """Machine-readable identity for remote clients (NegPy's psix backend)."""
+        st = scanner.status()
+        info = st.get("info") or {}
+        return jsonify({
+            "model": info.get("model") or st.get("display"),
+            "connected": bool(st.get("connected")),
+            "phase": st.get("phase"),
+        })
+
+    @app.route("/api/runner")
+    def api_runner():
+        """Scan/processing job state for pollers (NegPy's psix backend)."""
+        return jsonify(runner.state())
+
     @app.route("/api/scanner/connect", methods=["POST"])
     def api_scanner_connect():
         return jsonify(scanner.connect())
@@ -256,6 +273,43 @@ def create_app(data_dir=None):
             msg = str(exc)
             return jsonify({"error": msg}), (409 if "busy" in msg.lower() else 503)
         return jsonify({"action": action, "seconds": seconds, "moved": bool(ok)})
+
+    @app.route("/api/rolls/<int:roll_id>/raw")
+    def api_roll_raw(roll_id):
+        """Enumerate a roll's raw (uninverted, orange-mask-intact) negatives for
+        remote clients (NegPy's psix backend). 4-channel scans have ICE applied."""
+        roll = rolls.get(roll_id)
+        if roll is None:
+            abort(404)
+        nd = rolls.neg_dir(roll)
+        frames = []
+        for scan in roll.get("scans", []):
+            base = os.path.splitext(scan["filename"])[0]
+            idx = 0
+            while (nd / ("%s_f%02d_neg.tiff" % (base, idx))).exists():
+                ir_name = "%s_f%02d_neg_ir.tiff" % (base, idx)
+                frames.append({
+                    "scan": scan["filename"],
+                    "frame": idx,
+                    "rgb": "%s_f%02d_neg.tiff" % (base, idx),
+                    "ir": ir_name if (nd / ir_name).exists() else None,
+                })
+                idx += 1
+        return jsonify({"roll": roll_id, "frames": frames})
+
+    @app.route("/api/rolls/<int:roll_id>/raw/<path:filename>")
+    def api_roll_raw_file(roll_id, filename):
+        """Serve one raw negative artefact (*_neg.tiff / *_neg_ir.tiff)."""
+        roll = rolls.get(roll_id)
+        if roll is None:
+            abort(404)
+        safe = os.path.basename(filename)
+        if not (safe.endswith("_neg.tiff") or safe.endswith("_neg_ir.tiff")):
+            abort(403)
+        path = rolls.neg_dir(roll) / safe
+        if not path.exists():
+            abort(404)
+        return send_file(str(path), mimetype="image/tiff", max_age=0)
 
     @app.route("/api/rolls/<int:roll_id>/scan", methods=["POST"])
     def api_roll_scan(roll_id):
