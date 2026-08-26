@@ -496,13 +496,73 @@ def process_bin(binpath, flatref, out_prefix, gamma, contrast, pitch_override, i
         planes = apply_flatfield([seg[:, :W*3][:, c::3] for c in range(3)], whites, darks, balance=False)
         planes = [np.roll(planes[c], off[c], axis=0) for c in range(3)]
         dusty_planes = None
-        if ir_mode and white_ir is not None:               # IR-ICE: detect defects, inpaint RGB (pre-orient)
-            ir = np.roll(seg[:, IR_RGB:P], ir_offset, axis=0)
-            mask = ir_defect_mask(ir, white_ir, ir_thresh, ir_kernel, ir_min_size)
-            ndef += int(mask.sum())
-            if mask.any():
-                dusty_planes = planes                       # keep pre-inpaint for the ICE before/after sidecar
-                planes = inpaint_rgb(planes, mask)
+        if ir_mode and white_ir is not None:               # openICE: detect defects, inpaint RGB (pre-orient)
+            # Use openICE if available, otherwise fall back to black-hat
+            try:
+                from .ice import clean, create_ice_options, Calibration
+                import numpy as np
+                
+                # Estimate calibration from current frame (simplified)
+                # In a full implementation, this would come from a prescan
+                ir_float = ir.astype(np.float64)
+                # Find clear pixels (top 5% by IR value)
+                flat_ir = ir_float.flatten()
+                threshold_idx = max(1, len(flat_ir) // 20)  # Top 5%
+                clear_pixels = np.partition(flat_ir, -threshold_idx)[-threshold_idx:]
+                ir_ref_est = np.mean(clear_pixels)
+                
+                # Estimate c (R->IR leakage) by correlating R and IR in clear areas
+                # For simplicity, use a typical value or estimate from data
+                # TODO: Better estimation of c
+                c_est = 0.1  # Typical R->IR leakage
+                
+                # Create calibration
+                cal = Calibration(c=c_est, ir_ref=float(ir_ref_est))
+                
+                # Create options (using defaults that match PSIX usage)
+                opts = create_ice_options(
+                    model="Ls9000",  # Assume LS-9000 as default
+                    quality="Normal", 
+                    dpi=2000,  # Will be overridden if we had actual DPI
+                    metering_target=0.95
+                )
+                
+                # Apply openICE
+                # planes is [R, G, B] as float32 arrays after flatfield
+                # Convert to uint16 for the clean function (approximate)
+                color_planes = []
+                for plane in planes:
+                    # Clip and convert to uint16 range
+                    clipped = np.clip(plane, 0, 65535)
+                    color_planes.append(clipped.astype(np.uint16))
+                
+                # Apply the openICE reconstruction
+                pixels_fixed = clean(
+                    color=color_planes,
+                    ir=np.ascontiguousarray(ir.astype(np.uint16)),
+                    cal=cal,
+                    rows=planes[0].shape[0],
+                    cols=planes[0].shape[1],
+                    opts=opts
+                )
+                
+                # Convert back to float32 and store
+                for i in range(3):
+                    planes[i] = color_planes[i].astype(np.float32)
+                
+                ndef += pixels_fixed
+                if pixels_fixed > 0:
+                    dusty_planes = [p.copy() for p in planes]  # Keep copy for sidecar
+                    
+            except Exception as e:
+                # Fall back to original black-hat ICE if openICE fails
+                print(f"  Warning: openICE failed ({e}), falling back to black-hat")
+                ir = np.roll(seg[:, IR_RGB:P], ir_offset, axis=0)
+                mask = ir_defect_mask(ir, white_ir, ir_thresh, ir_kernel, ir_min_size)
+                ndef += int(mask.sum())
+                if mask.any():
+                    dusty_planes = planes                       # keep pre-inpaint for the ICE before/after sidecar
+                    planes = inpaint_rgb(planes, mask)
         cr = slice(a - a2, a - a2 + (b - a))
 
         def _orient(pl):                                    # planes -> oriented RGB neg (channel reorder + rot)
